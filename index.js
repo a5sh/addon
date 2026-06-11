@@ -1,6 +1,6 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.2.2',
+  version: '0.2.3',
   name: 'MoviesMod',
   description: 'Extracts HTTP streams from MoviesMod with direct download links',
   types: ['movie', 'series'],
@@ -171,53 +171,57 @@ async function searchMoviesMod(query) {
   }
 }
 
-// Extract download links from page
+// FIXED: Extract download links from page
 async function extractDownloadLinks(moviePageUrl) {
   try {
     const response = await fetchWithRetry(moviePageUrl);
     const html = await response.text();
 
     const links = [];
-    const contentBox = html.match(/<div[^>]*class="[^"]*thecontent[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    if (!contentBox) return links;
+    
+    // Extract from thecontent div
+    const contentBox = html.match(/<div[^>]*class="[^"]*thecontent[^"]*"[^>]*>([\s\S]*?)(?=<div class="post-navigation"|<h4 class="total-comments"|$)/i);
+    if (!contentBox || !contentBox[1]) {
+      console.log('[Extract] No thecontent div found');
+      return links;
+    }
 
-    // Extract quality headers and their content
-    const headerRegex = /<h3[^>]*>Season\s+(\d+)([\s\S]*?)<h3|<h4[^>]*>([\s\S]*?)<h[34]/gi;
+    const contentHtml = contentBox[1];
+
+    // FIXED: Match h4 headers with quality info followed by download links
+    // Pattern: <h4...>Quality Info</h4><p...><a href="...">Download Links</a></p>
+    const h4Regex = /<h4[^>]*>([\s\S]*?)<\/h4>\s*<p[^>]*>\s*<a[^>]*href=["']([^"']*?)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let headerMatch;
 
-    while ((headerMatch = headerRegex.exec(contentBox[1])) !== null) {
-      const seasonNum = headerMatch[1];
-      const seasonContent = headerMatch[2] || headerMatch[3];
+    while ((headerMatch = h4Regex.exec(contentHtml)) !== null) {
+      const headerText = headerMatch[1];
+      const downloadUrl = headerMatch[2];
       
-      if (seasonNum) {
-        // TV show
-        const episodeRegex = /href=["']([^"']*?)["'][^>]*>([^<]*Episode[^<]*)</gi;
-        let episodeMatch;
-        while ((episodeMatch = episodeRegex.exec(seasonContent)) !== null) {
-          const url = episodeMatch[1];
-          const title = episodeMatch[2];
-          if (url) {
-            links.push({
-              quality: `Season ${seasonNum} - ${title.trim()}`,
-              url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`,
-            });
-          }
-        }
-      } else {
-        // Movie - extract quality from h4
-        const qualityMatch = seasonContent.match(/^([^<]*)/);
-        const quality = qualityMatch ? qualityMatch[1].trim() : 'Unknown';
-        
-        const urlMatch = seasonContent.match(/href=["']([^"']*modrefer[^"']*)["']/i);
-        if (urlMatch && urlMatch[1]) {
-          links.push({
-            quality,
-            url: urlMatch[1].startsWith('http') ? urlMatch[1] : `${MOVIESMOD_BASE}${urlMatch[1]}`,
-          });
-        }
+      // Extract quality info from header (480p, 720p, 1080p, 10Bit, etc)
+      const qualityMatch = headerText.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
+      const bitMatch = headerText.match(/\b(10Bit|8Bit)\b/i);
+      const sizeMatch = headerText.match(/\[([0-9.]+\s*[KMGT]B)\]/);
+      
+      let quality = headerText.replace(/<[^>]*>/g, '').trim();
+      if (quality.length > 100) {
+        // If too long, extract just quality and size
+        quality = '';
+        if (qualityMatch) quality += qualityMatch[1];
+        if (bitMatch) quality += ' ' + bitMatch[1];
+        if (sizeMatch) quality += ' [' + sizeMatch[1] + ']';
+        if (!quality) quality = 'Unknown';
+      }
+
+      if (downloadUrl && downloadUrl.includes('modpro') || downloadUrl.includes('links')) {
+        links.push({
+          quality: quality,
+          url: downloadUrl.startsWith('http') ? downloadUrl : `${MOVIESMOD_BASE}${downloadUrl}`,
+        });
+        console.log(`[Extract] Found link - Quality: ${quality} -> ${downloadUrl.substring(0, 80)}`);
       }
     }
 
+    console.log(`[Extract] Found ${links.length} download links`);
     return links;
   } catch (error) {
     console.error(`Error extracting download links:`, error.message);
@@ -355,26 +359,33 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality) {
       }
       return finalLinks;
 
-    } else if (urlObject.hostname.includes('modrefer.in')) {
-      console.log(`[ModRefer] Decoding: ${initialUrl}`);
-      const encodedUrl = urlObject.searchParams.get('url');
-      if (!encodedUrl) return [];
-
-      const decodedUrl = Buffer.from(encodedUrl, 'base64').toString('utf8');
-      const response = await fetchWithRetry(decodedUrl, { headers: { 'Referer': refererUrl } });
+    } else if (urlObject.hostname.includes('modrefer.in') || urlObject.hostname.includes('links.modpro.blog')) {
+      console.log(`[ModRefer] Processing: ${initialUrl}`);
+      const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
 
       const finalLinks = [];
-      const linkRegex = /<a\s+href=["']([^"']+?)["'][^>]*>([^<]*)<\/a>/gi;
+      
+      // Look for direct download links
+      const linkRegex = /<a\s+href=["']([^"']+?)["'][^>]*>([^<]*?)<\/a>/gi;
       let match;
       
       while ((match = linkRegex.exec(html)) !== null) {
         const url = match[1];
         const text = match[2];
-        if (url && text && !text.toLowerCase().includes('comment')) {
-          finalLinks.push({ server: text.trim(), url });
+        
+        // Filter for actual download services (driveseed, etc)
+        if (url && text && 
+            (url.includes('driveseed') || url.includes('drive') || url.includes('cloud')) &&
+            !text.toLowerCase().includes('comment')) {
+          finalLinks.push({ 
+            server: text.trim() || 'Direct Link', 
+            url 
+          });
         }
       }
+      
+      console.log(`[ModRefer] Found ${finalLinks.length} links`);
       return finalLinks;
     }
 
@@ -451,7 +462,7 @@ async function resolveDriveseedLink(driveseedUrl) {
   }
 }
 
-// Extract all downloadable links from a movie page
+// FIXED: Extract all downloadable links from a movie page
 async function extractAllDownloadableLinks(moviePageUrl) {
   try {
     console.log(`[Extract] Getting all downloadable links from: ${moviePageUrl}`);
@@ -464,15 +475,15 @@ async function extractAllDownloadableLinks(moviePageUrl) {
 
     const allDownloadableLinks = [];
 
-    for (const link of downloadLinks.slice(0, 8)) {
+    for (const link of downloadLinks.slice(0, 10)) {
       try {
         console.log(`[Extract] Processing quality: ${link.quality}`);
         
-        // Skip 480p
-        if (link.quality.toLowerCase().includes('480p')) {
-          console.log(`[Extract] Skipping 480p: ${link.quality}`);
-          continue;
-        }
+        // Skip 480p if you want (optional)
+        // if (link.quality.toLowerCase().includes('480p')) {
+        //   console.log(`[Extract] Skipping 480p: ${link.quality}`);
+        //   continue;
+        // }
 
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality);
         
@@ -503,6 +514,14 @@ async function extractAllDownloadableLinks(moviePageUrl) {
                   fileName,
                 });
               }
+            } else {
+              // Direct link
+              allDownloadableLinks.push({
+                quality: link.quality,
+                server: targetLink.server,
+                method: 'Direct Link',
+                url: currentUrl,
+              });
             }
           } catch (e) {
             console.error(`[Extract] Error with ${targetLink.server}:`, e.message);
