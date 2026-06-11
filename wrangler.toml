@@ -1,0 +1,59 @@
+name = "addon"
+type = "javascript"
+account_id = "381e7575580a02003bd9a2d345c9e757"
+workers_dev = true
+
+# Optional: Use custom domain instead of workers.dev
+# route = "example.com/moviesmod/*"
+# zone_id = "YOUR_ZONE_ID
+
+vars = {
+  MOVIESMOD_BASE = "https://moviesmod.money",
+  ENVIRONMENT = "production"
+}
+
+# Optional: Development environment
+[env.development]
+name = "moviesmod-addon-dev"
+workers_dev = true
+
+vars = {
+  MOVIESMOD_BASE = "https://moviesmod.money",
+  ENVIRONMENT = "development"
+}
+
+# Service bindings (if you create other workers)
+# [[services]]
+# binding = "AUTH_WORKER"
+# service = "auth-service"
+# environment = "production"
+
+# KV namespace bindings (for caching)
+# [[kv_namespaces]]
+# binding = "MOVIESMOD_CACHE"
+# id = "YOUR_KV_NAMESPACE_ID"
+# preview_id = "YOUR_PREVIEW_KV_ID"
+
+# Durable objects (advanced caching)
+# [[durable_objects.bindings]]
+# name = "COUNTER"
+# class_name = "Counter"
+# script_name = "moviesmod-addon"
+
+# Build configuration
+[build]
+command = "npm install"
+cwd = "./"
+watch_paths = ["src/**/*.js"]
+
+[build.upload]
+format = "service-worker"
+
+# Limits
+limits = {
+  cpu_ms = 50  # Max CPU time per request (production plan allows more)
+}
+
+# Compatibility settings
+compatibility_date = "2026-01-15"
+compatibility_flags = ["nodejs_compat"]  # For Node.js APIs if needed
