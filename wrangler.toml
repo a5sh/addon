@@ -2,3 +2,5 @@ name = "addon"
 compatibility_date = "2026-06-11"
 main = "index.js"
 vars = { BROWSERLESS_KEY = "2UgUUUpxPdKGY2k1d392ef2a06f06b8d66e89b8185ef67906" }
+[browser]
+binding = "MYBROWSER"
