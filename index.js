@@ -1,8 +1,8 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.3.1',
+  version: '0.3.2',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams from MoviesMod with direct download links (Strict Sequential & Header Spoofed)',
+  description: 'Extracts HTTP streams from MoviesMod (Strict Sequential, Cache Bypassed)',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -38,6 +38,7 @@ async function fetchWithRetry(url, options = {}, retries = 1) {
       const response = await fetch(url, {
         ...options,
         signal: controller.signal,
+        cache: 'no-store', // CRITICAL: Forces Cloudflare to skip cache and return Set-Cookie headers
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           ...options.headers,
@@ -150,52 +151,36 @@ async function extractDownloadLinks(moviePageUrl, logs) {
   }
 }
 
-// SID Resolver enforcing strict sequential HTTP contexts and Origin/Referer spoofing
+// SID Resolver enforcing strict sequential HTTP contexts, Cache Bypassing, and 10s Wait
 async function resolveTechUnblockedLink(sidUrl, logs) {
   logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
   const cookieMap = new Map();
 
-  function extractCookies(res, htmlBody) {
+  function extractCookies(res) {
     try {
-      let headerCookies = [];
-      if (typeof res.headers.getSetCookie === 'function') {
-        headerCookies = res.headers.getSetCookie();
-      } else {
-        const sc = res.headers.get('set-cookie');
-        if (sc) headerCookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
-      }
-
-      headerCookies.forEach(c => {
-        const pair = c.split(';')[0].trim();
-        const [k, ...v] = pair.split('=');
-        if (k && !['path', 'expires', 'domain', 'httponly', 'secure', 'samesite'].includes(k.toLowerCase())) {
-          cookieMap.set(k.trim(), v.join('='));
-        }
-      });
-
-      if (htmlBody) {
-        const jsRegex = /document\.cookie\s*=\s*["']([^"']+)["']/gi;
-        let match;
-        while ((match = jsRegex.exec(htmlBody)) !== null) {
-          const pair = match[1].split(';')[0].trim();
+      const sc = res.headers.get('set-cookie');
+      if (sc) {
+        logs.push(`[SID] Intercepted Cookie header successfully.`);
+        // Split cookies safely ignoring commas inside date strings
+        const cookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
+        cookies.forEach(c => {
+          const pair = c.split(';')[0].trim();
           const [k, ...v] = pair.split('=');
-          if (k) cookieMap.set(k.trim(), v.join('='));
-        }
+          if (k && !['path', 'expires', 'domain', 'httponly', 'secure', 'samesite', 'max-age'].includes(k.toLowerCase())) {
+            cookieMap.set(k.trim(), v.join('='));
+          }
+        });
       }
     } catch (e) {
        logs.push(`[SID] Warning: Cookie parsing error: ${e.message}`);
     }
   }
 
-  function getHeaders(referer, crossSite = false) {
+  function getHeaders(referer) {
     const headers = { 
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': crossSite ? 'cross-site' : 'same-origin',
       'Upgrade-Insecure-Requests': '1'
     };
     if (referer) headers['Referer'] = referer;
@@ -207,9 +192,9 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
 
   try {
     // Step 1: Initialize session token
-    let response = await fetchWithRetry(sidUrl, { headers: getHeaders(null, true), redirect: 'manual' }, 0);
+    let response = await fetchWithRetry(sidUrl, { headers: getHeaders(), redirect: 'manual' }, 0);
     let html = await response.text();
-    extractCookies(response, html);
+    extractCookies(response);
     
     let wp_http = getMatch(html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
     let action1 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
@@ -224,12 +209,12 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     const formData1 = new URLSearchParams({ '_wp_http': wp_http });
     response = await fetchWithRetry(action1Url, {
       method: 'POST',
-      headers: { ...getHeaders(sidUrl), 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': origin },
+      headers: { ...getHeaders(sidUrl), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formData1.toString(),
       redirect: 'manual'
     }, 0);
     html = await response.text();
-    extractCookies(response, html);
+    extractCookies(response);
     
     let wp_http2 = getMatch(html, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
     let token = getMatch(html, /name=["']token["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']token["']/i);
@@ -245,12 +230,12 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     const formData2 = new URLSearchParams({ '_wp_http2': wp_http2, token });
     response = await fetchWithRetry(action2Url, {
       method: 'POST',
-      headers: { ...getHeaders(action1Url), 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': origin },
+      headers: { ...getHeaders(action1Url), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formData2.toString(),
       redirect: 'manual'
     }, 0);
     html = await response.text();
-    extractCookies(response, html);
+    extractCookies(response);
     
     let matchUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+)"\)/);
     if (!matchUrl) {
@@ -263,14 +248,15 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     }
     
     const intermediateUrl = new URL(matchUrl, origin).href;
-    logs.push(`[SID] Intermediary URL extracted. Waiting 4.5s to clear velocity timer...`);
+    logs.push(`[SID] Intermediary URL extracted. Waiting 10s to bypass velocity trap...`);
 
-    // EXPLOIT: Force 4500ms delay to clear the backend "Double Click" velocity anti-bot trap
-    await new Promise(r => setTimeout(r, 4500));
+    // EXPLOIT: Force 10000ms delay to clear the backend "Double Click" trap completely
+    await new Promise(r => setTimeout(r, 10000));
 
     // Step 4: Follow jump link with strict cookie preservation
     const redirectRes = await fetch(intermediateUrl, {
       method: 'GET',
+      cache: 'no-store',
       headers: getHeaders(action2Url),
       redirect: 'manual' 
     });
@@ -282,7 +268,7 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     } else {
       const redirectHtml = await redirectRes.text();
       if (redirectHtml.includes("Bad Request")) {
-        logs.push(`[SID] ✗ Target returned Bad Request despite wait limit. Map size: ${cookieMap.size}`);
+        logs.push(`[SID] ✗ Target returned Bad Request. Map size: ${cookieMap.size}`);
         return null;
       }
       const jsRedirectMatch = getMatch(redirectHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
@@ -397,7 +383,9 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
       const text = stripTags(match[2]).toLowerCase();
 
       if (href.includes('instant') || href.includes('video-seed')) {
-        if (text.includes('instant')) downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
+        if (text.includes('instant')) {
+          downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
+        }
       } else if (href.includes('resume')) {
         downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
       } else if (href.includes('worker')) {
@@ -429,19 +417,14 @@ async function extractAllDownloadableLinks(moviePageUrl) {
     }
 
     const allDownloadableLinks = [];
-    const startTime = Date.now();
 
-    // STRICT SEQUENTIAL PROCESSING: Limit to 4 to guarantee completion within 30s worker limit
-    for (const link of downloadLinks.slice(0, 4)) {
-      if (Date.now() - startTime > 26000) {
-         logs.push(`[Main] ⚠️ Cloudflare execution limit approaching. Ending extractions early.`);
-         break;
-      }
-
+    // LIMIT TO EXACTLY 1 QUALITY to guarantee the 10s timeout completes before Cloudflare drops the worker
+    for (const link of downloadLinks.slice(0, 1)) {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
         
+        // LIMIT TO 1 SERVER (G-Drive)
         const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
         const targetsToProcess = primaryTarget ? [primaryTarget] : [];
 
@@ -525,7 +508,7 @@ async function handleRequest(request) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (Strict Sequential & Safe)</p>
+    <p class="subtitle">Search & Extract Direct Download Links (Targeted Quality + Anti-Bot Bypass)</p>
     
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
@@ -581,7 +564,7 @@ async function handleRequest(request) {
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Processing sequentially (takes ~20 seconds)...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Bypassing Safelink (takes 10-15 seconds)...</div>';
         
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
