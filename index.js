@@ -13,12 +13,8 @@ const MANIFEST = {
   },
 };
 
-const TMDB_API_BASE = 'https://api.themoviedb.org/3';
-const MOVIESMOD_BASE = 'https://moviesmod.money'; // adjust domain as needed
+const MOVIESMOD_BASE = 'https://moviesmod.money';
 
-/**
- * Fetch from external API with timeout and retries
- */
 async function fetchWithRetry(url, options = {}, retries = 3) {
   const timeout = options.timeout || 10000;
   const controller = new AbortController();
@@ -30,6 +26,10 @@ async function fetchWithRetry(url, options = {}, retries = 3) {
         const response = await fetch(url, {
           ...options,
           signal: controller.signal,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            ...options.headers,
+          },
         });
         clearTimeout(timeoutId);
         return response;
@@ -44,140 +44,78 @@ async function fetchWithRetry(url, options = {}, retries = 3) {
   }
 }
 
-/**
- * Convert IMDb ID to TMDB ID
- */
-async function getIMDBtoTMDB(imdbId) {
-  const tmdbKey = 'TMDB_KEY'; // Set via environment variable
-  if (!tmdbKey) {
-    throw new Error('TMDB_KEY not configured');
-  }
-
+async function searchMoviesMod(query) {
   try {
-    const url = `${TMDB_API_BASE}/find/${imdbId}?external_source=imdb_id&api_key=${tmdbKey}`;
-    const response = await fetchWithRetry(url);
-    const data = await response.json();
-
-    const results = data.movie_results || data.tv_results || [];
-    if (results.length === 0) {
-      return null;
-    }
-    return results[0].id;
-  } catch (error) {
-    console.error(`Failed to convert IMDb to TMDB: ${imdbId}`, error);
-    return null;
-  }
-}
-
-/**
- * Search MoviesMod for a movie/series
- */
-async function searchMoviesMod(title, year, isSeries = false) {
-  try {
-    const searchQuery = `${title}${year ? ` ${year}` : ''}`;
-    const searchUrl = new URL(`${MOVIESMOD_BASE}/?s=${encodeURIComponent(searchQuery)}`);
+    const searchUrl = new URL(MOVIESMOD_BASE);
+    searchUrl.pathname = '/';
+    searchUrl.searchParams.set('s', query);
 
     const response = await fetchWithRetry(searchUrl.toString());
     const html = await response.text();
 
-    // Simple regex-based HTML parsing for search results
-    const matches = html.matchAll(
-      /href=["']([^"']*?)["'][^>]*>([^<]+)<\/a>/gi
-    );
-
     const results = [];
-    for (const match of matches) {
-      const link = match[1];
-      const text = match[2];
+    const linkRegex = /href=["']([^"']*?)["'][^>]*>([^<]*)<\/a>/gi;
+    let match;
 
-      // Filter by type and relevance
-      if (
-        (isSeries && link.includes('/series/')) ||
-        (!isSeries && !link.includes('/series/'))
-      ) {
+    while ((match = linkRegex.exec(html)) !== null) {
+      const url = match[1];
+      const title = match[2];
+
+      if (url && title && !url.includes('javascript')) {
         results.push({
-          url: link,
-          title: text,
+          url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`,
+          title: title.trim(),
         });
       }
     }
 
-    return results.length > 0 ? results[0] : null;
+    return results;
   } catch (error) {
-    console.error(`MoviesMod search failed for: ${title}`, error);
-    return null;
-  }
-}
-
-/**
- * Extract stream URLs from MoviesMod page
- */
-async function extractStreamsFromMoviesMod(pageUrl, meta = {}) {
-  try {
-    const response = await fetchWithRetry(pageUrl);
-    const html = await response.text();
-
-    const streams = [];
-
-    // Look for common video embed patterns
-    // Pattern 1: iframe sources
-    const iframeMatches = html.matchAll(
-      /iframe[^>]*src=["']([^"']*?)["']/gi
-    );
-    for (const match of iframeMatches) {
-      const embedUrl = match[1];
-      if (embedUrl && !embedUrl.includes('moviesmod')) {
-        streams.push({
-          url: embedUrl,
-          title: meta.title || 'MoviesMod Stream',
-        });
-      }
-    }
-
-    // Pattern 2: Direct video links
-    const videoMatches = html.matchAll(
-      /(?:href|src)=["']([^"']*?\.(?:mp4|mkv|m3u8)[^"']*?)["']/gi
-    );
-    for (const match of videoMatches) {
-      const videoUrl = match[1];
-      if (videoUrl && !videoUrl.includes('moviesmod')) {
-        streams.push({
-          url: videoUrl,
-          title: meta.title || 'MoviesMod Stream',
-        });
-      }
-    }
-
-    // Pattern 3: Data attributes with URLs
-    const dataMatches = html.matchAll(
-      /data-(?:link|video|src)=["']([^"']+)["']/gi
-    );
-    for (const match of dataMatches) {
-      let linkUrl = match[1];
-      // Decode if needed
-      if (linkUrl.startsWith('http')) {
-        streams.push({
-          url: linkUrl,
-          title: meta.title || 'MoviesMod Stream',
-        });
-      }
-    }
-
-    return streams;
-  } catch (error) {
-    console.error(`Failed to extract streams from: ${pageUrl}`, error);
+    console.error(`MoviesMod search error: ${error.message}`);
     return [];
   }
 }
 
-/**
- * Main handler for requests
- */
+async function extractStreamsFromPage(html, pageUrl) {
+  const streams = [];
+
+  const iframeRegex = /iframe[^>]*src=["']([^"']*?)["']/gi;
+  let match;
+  while ((match = iframeRegex.exec(html)) !== null) {
+    const url = match[1];
+    if (url && url.startsWith('http') && !url.includes('moviesmod')) {
+      streams.push(url);
+    }
+  }
+
+  const embedRegex = /(?:data-src|src)=["']([^"']*?(?:mp4|m3u8|mkv)[^"']*)["']/gi;
+  while ((match = embedRegex.exec(html)) !== null) {
+    const url = match[1];
+    if (url && url.startsWith('http') && !url.includes('moviesmod')) {
+      streams.push(url);
+    }
+  }
+
+  const dataRegex = /(?:data-link|data-video|data-src)=["']([^"']+)["']/gi;
+  while ((match = dataRegex.exec(html)) !== null) {
+    let url = match[1];
+    if (url.includes('%')) {
+      try {
+        url = decodeURIComponent(url);
+      } catch {}
+    }
+    if (url && url.startsWith('http') && !url.includes('moviesmod')) {
+      streams.push(url);
+    }
+  }
+
+  return [...new Set(streams)].slice(0, 10);
+}
+
 async function handleRequest(request) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // Manifest endpoint
   if (path === '/manifest.json') {
     return new Response(JSON.stringify(MANIFEST), {
       headers: {
@@ -187,137 +125,319 @@ async function handleRequest(request) {
     });
   }
 
-  // Stream endpoint: /stream/:type/:id.json
   const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
   if (streamMatch) {
-    const type = streamMatch[1]; // 'movie' or 'series'
-    const rawId = streamMatch[2]; // IMDb or TMDB ID
+    const type = streamMatch[1];
+    const id = streamMatch[2];
 
     try {
-      let imdbId, tmdbId, title, year, isSeries;
-
-      // Parse ID
-      if (rawId.startsWith('tt')) {
-        imdbId = rawId;
-        tmdbId = await getIMDBtoTMDB(imdbId);
-      } else if (rawId.startsWith('tmdb:')) {
-        tmdbId = rawId.substring(5);
-      } else {
-        return jsonError('Unsupported ID format', 400);
+      if (!id.startsWith('tt') && !id.startsWith('tmdb:')) {
+        return new Response(JSON.stringify({ streams: [] }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
       }
 
-      // For now, we'll use a simple search
-      // In production, you'd fetch from TMDB to get proper metadata
-      isSeries = type === 'series';
-
-      // Search MoviesMod
-      const searchResult = await searchMoviesMod(title || 'Unknown', year, isSeries);
-      if (!searchResult) {
-        return jsonResponse({ streams: [] });
+      const results = await searchMoviesMod(id);
+      if (!results.length) {
+        return new Response(JSON.stringify({ streams: [] }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
       }
 
-      // Extract streams
-      const movieStreams = await extractStreamsFromMoviesMod(searchResult.url, {
-        title: searchResult.title,
-      });
+      const pageResponse = await fetchWithRetry(results[0].url);
+      const pageHtml = await pageResponse.text();
+      const streamUrls = await extractStreamsFromPage(pageHtml, results[0].url);
 
-      // Format for Stremio
-      const streams = movieStreams.map(stream => ({
-        url: stream.url,
-        title: `${stream.title} (MoviesMod)`,
-        behaviorHints: {
-          notWebReady: !stream.url.includes('.mp4'),
-        },
+      const streams = streamUrls.map((url, index) => ({
+        url,
+        title: `${results[0].title} [${index + 1}]`,
       }));
 
-      return jsonResponse({ streams });
+      return new Response(JSON.stringify({ streams }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
     } catch (error) {
-      console.error('Stream resolution error:', error);
-      return jsonResponse({ streams: [] });
+      console.error(`Stream error: ${error.message}`);
+      return new Response(JSON.stringify({ streams: [] }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
     }
   }
 
-  // Configure endpoint (optional)
-  if (path === '/configure') {
-    return new Response(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>MoviesMod Addon</title>
-        <style>
-          body { font-family: Arial, sans-serif; padding: 20px; }
-          .container { max-width: 600px; margin: 0 auto; }
-          h1 { color: #333; }
-          p { color: #666; line-height: 1.6; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>MoviesMod Stremio Addon</h1>
-          <p>This addon extracts HTTP streams from MoviesMod.</p>
-          <p><strong>Installation URL:</strong></p>
-          <code>${url.origin}/manifest.json</code>
-          <p><strong>Features:</strong></p>
-          <ul>
-            <li>Stream extraction from MoviesMod</li>
-            <li>Support for movies and series</li>
-            <li>IMDb and TMDB ID support</li>
-          </ul>
-        </div>
-      </body>
-      </html>
-    `, {
-      headers: {
-        'Content-Type': 'text/html',
-        'Access-Control-Allow-Origin': '*',
-      },
+  if (path === '/' || path === '/search') {
+    return new Response(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoviesMod Search</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 600px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+      text-align: center;
+    }
+    .subtitle {
+      color: #666;
+      text-align: center;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    .search-box {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 30px;
+    }
+    input {
+      flex: 1;
+      padding: 12px 16px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 16px;
+      transition: border-color 0.3s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    button {
+      padding: 12px 30px;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    button:hover {
+      background: #764ba2;
+    }
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    .results {
+      margin-top: 30px;
+    }
+    .result-item {
+      background: #f5f5f5;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      border-left: 4px solid #667eea;
+    }
+    .result-title {
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 8px;
+    }
+    .result-url {
+      font-size: 12px;
+      color: #666;
+      word-break: break-all;
+      font-family: monospace;
+    }
+    .loading {
+      text-align: center;
+      color: #666;
+      padding: 20px;
+    }
+    .error {
+      background: #fee;
+      color: #c33;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 20px;
+      border-left: 4px solid #c33;
+    }
+    .empty {
+      text-align: center;
+      color: #999;
+      padding: 40px 20px;
+    }
+    .help {
+      background: #f0f4ff;
+      padding: 15px;
+      border-radius: 8px;
+      color: #555;
+      font-size: 13px;
+      line-height: 1.6;
+      margin-bottom: 30px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎬 MoviesMod Search</h1>
+    <p class="subtitle">Search for movies and series</p>
+    
+    <div class="help">
+      <strong>How to use:</strong><br>
+      • Enter a movie or series title<br>
+      • Click Search to find streams<br>
+      • Results show available links from MoviesMod
+    </div>
+
+    <div class="search-box">
+      <input 
+        type="text" 
+        id="searchInput" 
+        placeholder="Search movie or series..." 
+        onkeypress="if(event.key==='Enter') search()"
+      >
+      <button onclick="search()">Search</button>
+    </div>
+
+    <div id="results" class="results"></div>
+  </div>
+
+  <script>
+    const resultsDiv = document.getElementById('results');
+    const searchInput = document.getElementById('searchInput');
+
+    async function search() {
+      const query = searchInput.value.trim();
+      if (!query) {
+        resultsDiv.innerHTML = '<div class="empty">Enter a search term</div>';
+        return;
+      }
+
+      resultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+
+      try {
+        const response = await fetch(\`\${window.location.origin}/search-api?q=\${encodeURIComponent(query)}\`);
+        const data = await response.json();
+
+        if (!data.results || data.results.length === 0) {
+          resultsDiv.innerHTML = '<div class="empty">No results found</div>';
+          return;
+        }
+
+        resultsDiv.innerHTML = data.results.map((result, idx) => \`
+          <div class="result-item">
+            <div class="result-title">\${idx + 1}. \${result.title}</div>
+            <div class="result-url">\${result.url}</div>
+          </div>
+        \`).join('');
+      } catch (error) {
+        resultsDiv.innerHTML = \`<div class="error">Error: \${error.message}</div>\`;
+      }
+    }
+
+    searchInput.focus();
+  </script>
+</body>
+</html>`, {
+      headers: { 'Content-Type': 'text/html' },
     });
   }
 
-  // Root redirect
-  if (path === '/') {
-    return new Response('Redirect', {
-      status: 301,
-      headers: { Location: '/configure' },
+  if (path === '/search-api') {
+    const query = url.searchParams.get('q');
+    if (!query) {
+      return new Response(JSON.stringify({ results: [] }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+
+    try {
+      const results = await searchMoviesMod(query);
+      return new Response(JSON.stringify({ results: results.slice(0, 10) }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    } catch (error) {
+      console.error(`Search error: ${error.message}`);
+      return new Response(JSON.stringify({ results: [], error: error.message }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+  }
+
+  if (path === '/configure') {
+    return new Response(`<!DOCTYPE html>
+<html>
+<head>
+  <title>MoviesMod Addon</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 40px;
+      max-width: 600px;
+      margin: 0 auto;
+      background: #f5f5f5;
+    }
+    h1 { color: #333; }
+    p { color: #666; line-height: 1.6; }
+    code { background: #eee; padding: 2px 6px; }
+  </style>
+</head>
+<body>
+  <h1>MoviesMod Stremio Addon</h1>
+  <p>Stream extraction addon for MoviesMod</p>
+  <p><strong>Manifest URL:</strong></p>
+  <code>\${url.origin}/manifest.json</code>
+  <p><strong>Features:</strong></p>
+  <ul>
+    <li>Search movies and series</li>
+    <li>Extract streams from MoviesMod</li>
+    <li>Multiple source support</li>
+  </ul>
+</body>
+</html>`, {
+      headers: { 'Content-Type': 'text/html' },
     });
   }
 
   return new Response('Not Found', { status: 404 });
 }
 
-/**
- * Helper: JSON response
- */
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    },
-  });
-}
-
-/**
- * Helper: JSON error response
- */
-function jsonError(message, status = 500) {
-  return jsonResponse({ error: message }, status);
-}
-
-/**
- * Cloudflare Worker entry point
- */
 export default {
   async fetch(request, env, ctx) {
-    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type',
         },
       });
@@ -327,7 +447,10 @@ export default {
       return await handleRequest(request);
     } catch (error) {
       console.error('Worker error:', error);
-      return jsonError('Internal server error', 500);
+      return new Response(JSON.stringify({ error: 'Internal server error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
   },
 };
