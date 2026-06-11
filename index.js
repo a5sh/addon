@@ -1,6 +1,8 @@
+import * as cheerio from 'https://esm.sh/cheerio';
+
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.2.3',
+  version: '0.2.4',
   name: 'MoviesMod',
   description: 'Extracts HTTP streams from MoviesMod with direct download links',
   types: ['movie', 'series'],
@@ -74,55 +76,7 @@ async function fetchWithRetry(url, options = {}, retries = 3) {
   }
 }
 
-// Simple string similarity (Levenshtein distance)
-function stringSimilarity(str1, str2) {
-  const s1 = str1.toLowerCase();
-  const s2 = str2.toLowerCase();
-  const longer = s1.length > s2.length ? s1 : s2;
-  const shorter = s1.length > s2.length ? s2 : s1;
-  
-  if (longer.length === 0) return 1.0;
-  
-  const editDistance = getEditDistance(longer, shorter);
-  return (longer.length - editDistance) / longer.length;
-}
-
-function getEditDistance(s1, s2) {
-  const costs = [];
-  for (let i = 0; i <= s1.length; i++) {
-    let lastValue = i;
-    for (let j = 0; j <= s2.length; j++) {
-      if (i === 0) {
-        costs[j] = j;
-      } else if (j > 0) {
-        let newValue = costs[j - 1];
-        if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
-          newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
-        }
-        costs[j - 1] = lastValue;
-        lastValue = newValue;
-      }
-    }
-    if (i > 0) costs[s2.length] = lastValue;
-  }
-  return costs[s2.length];
-}
-
-// Find best matching title
-function findBestMatch(query, titles) {
-  let bestMatch = { title: '', rating: 0, index: -1 };
-  
-  titles.forEach((title, index) => {
-    const rating = stringSimilarity(query, title);
-    if (rating > bestMatch.rating) {
-      bestMatch = { title, rating, index };
-    }
-  });
-  
-  return bestMatch;
-}
-
-// Search for content on MoviesMod
+// Search for content on MoviesMod using AST
 async function searchMoviesMod(query) {
   const cacheKey = `search:${query}`;
   if (cache.has(cacheKey)) {
@@ -137,14 +91,17 @@ async function searchMoviesMod(query) {
     const searchUrl = `${MOVIESMOD_BASE}/?s=${encodeURIComponent(query)}`;
     const response = await fetchWithRetry(searchUrl);
     const html = await response.text();
+    const $ = cheerio.load(html);
 
     const results = [];
-    const linkRegex = /href=["']([^"']*?)["'][^>]*title=["']([^"']*?)["']/gi;
-    let match;
-
-    while ((match = linkRegex.exec(html)) !== null) {
-      const url = match[1];
-      const title = match[2];
+    
+    // Evaluate standard content container layouts for search
+    $('article.latestPost, article.post, .post').each((_, el) => {
+      const a = $(el).find('h2 a, .title a, a.title').first();
+      if (a.length === 0) return;
+      
+      const url = a.attr('href');
+      const title = a.attr('title') || a.text().trim();
 
       if (url && title && !url.includes('javascript')) {
         const fullUrl = url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`;
@@ -152,12 +109,12 @@ async function searchMoviesMod(query) {
         if (!results.some(r => r.url === fullUrl)) {
           results.push({
             url: fullUrl,
-            title: title.trim(),
+            title: title,
             source: 'moviesmod',
           });
         }
       }
-    }
+    });
 
     cache.set(cacheKey, {
       data: results,
@@ -172,80 +129,89 @@ async function searchMoviesMod(query) {
 }
 
 // Extract download links from page
-async function extractDownloadLinks(moviePageUrl) {
+async function extractDownloadLinks(moviePageUrl, logs) {
   try {
+    logs.push(`[Extract] Fetching movie page: ${moviePageUrl}`);
     const response = await fetchWithRetry(moviePageUrl);
     const html = await response.text();
 
+    const $ = cheerio.load(html);
     const links = [];
     
-    // Extract from thecontent div
-    const contentBox = html.match(/<div[^>]*class="[^"]*thecontent[^"]*"[^>]*>([\s\S]*?)(?=<div class="post-navigation"|<h4 class="total-comments"|$)/i);
-    if (!contentBox || !contentBox[1]) {
-      console.log('[Extract] No thecontent div found');
+    const contentBox = $('.thecontent');
+    if (contentBox.length === 0) {
+      logs.push('[Extract] ✗ No .thecontent div found');
       return links;
     }
 
-    const contentHtml = contentBox[1];
-
-    // Match h4 headers with quality info followed by download links
-    const h4Regex = /<h4[^>]*>([\s\S]*?)<\/h4>\s*<p[^>]*>\s*<a[^>]*href=["']([^"']*?)["'][^>]*>([\s\S]*?)<\/a>/gi;
-    let headerMatch;
-
-    while ((headerMatch = h4Regex.exec(contentHtml)) !== null) {
-      const headerText = headerMatch[1];
-      const downloadUrl = headerMatch[2];
+    let lastHeader = 'Unknown Quality';
+    
+    // Iterate sequentially over elements to associate links with the closest preceding header
+    contentBox.children().each((_, el) => {
+      const tagName = el.tagName.toLowerCase();
       
-      // Extract quality info from header (480p, 720p, 1080p, 10Bit, etc)
-      const qualityMatch = headerText.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
-      const bitMatch = headerText.match(/\b(10Bit|8Bit)\b/i);
-      const sizeMatch = headerText.match(/\[([0-9.]+\s*[KMGT]B)\]/);
-      
-      let quality = headerText.replace(/<[^>]*>/g, '').trim();
-      if (quality.length > 100) {
-        // If too long, extract just quality and size
-        quality = '';
-        if (qualityMatch) quality += qualityMatch[1];
-        if (bitMatch) quality += ' ' + bitMatch[1];
-        if (sizeMatch) quality += ' [' + sizeMatch[1] + ']';
-        if (!quality) quality = 'Unknown';
-      }
+      if (['h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
+        lastHeader = $(el).text().trim();
+      } else if (tagName === 'p' || tagName === 'div') {
+        $(el).find('a').each((_, aEl) => {
+          const a = $(aEl);
+          const url = a.attr('href');
+          
+          if (url && (url.includes('modpro') || url.includes('links'))) {
+            logs.push(`[Extract] Evaluated anchor URL: ${url}`);
+            
+            // Apply regex extraction against the active state of lastHeader
+            const qualityMatch = lastHeader.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
+            const bitMatch = lastHeader.match(/\b(10Bit|8Bit)\b/i);
+            const sizeMatch = lastHeader.match(/\[([0-9.]+\s*[KMGT]B)\]/i);
+            
+            let quality = lastHeader;
+            if (quality.length > 100) {
+              quality = '';
+              if (qualityMatch) quality += qualityMatch[1];
+              if (bitMatch) quality += ' ' + bitMatch[1];
+              if (sizeMatch) quality += ' [' + sizeMatch[1] + ']';
+              if (!quality) quality = 'Unknown';
+            }
 
-      if (downloadUrl && downloadUrl.includes('modpro') || downloadUrl.includes('links')) {
-        links.push({
-          quality: quality,
-          url: downloadUrl.startsWith('http') ? downloadUrl : `${MOVIESMOD_BASE}${downloadUrl}`,
+            links.push({
+              quality: quality.trim(),
+              url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`,
+            });
+            logs.push(`[Extract] ✓ Captured link for quality: ${quality.trim()}`);
+          }
         });
-        console.log(`[Extract] Found link - Quality: ${quality} -> ${downloadUrl.substring(0, 80)}`);
       }
-    }
+    });
 
-    console.log(`[Extract] Found ${links.length} download links`);
+    logs.push(`[Extract] Found ${links.length} download links`);
     return links;
   } catch (error) {
-    console.error(`Error extracting download links:`, error.message);
+    logs.push(`[Extract] ✗ Error extracting download links: ${error.message}`);
     return [];
   }
 }
 
-// Resolve SID (tech.unblockedgames.world / cloud.unblockedgames.world) links
-async function resolveTechUnblockedLink(sidUrl) {
-  console.log(`[SID] Resolving: ${sidUrl.substring(0, 80)}...`);
+// Resolve SID (unblockedgames.world, creativeexpressions) token payloads
+async function resolveTechUnblockedLink(sidUrl, logs) {
+  logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
 
   try {
-    // Step 1: Get initial form
     let response = await fetchWithRetry(sidUrl);
     let html = await response.text();
-    let match = html.match(/name="_wp_http"\s+value="([^"]+)"/);
-    if (!match) throw new Error('Could not find _wp_http in initial form');
-    const wp_http = match[1];
+    let $ = cheerio.load(html);
+    
+    const wp_http = $('input[name="_wp_http"]').val();
+    let action1 = $('form').attr('action');
+    
+    if (!wp_http || !action1) {
+      logs.push(`[SID] ✗ Could not find initial token _wp_http or form action.`);
+      return null;
+    }
+    action1 = new URL(action1, origin).href;
+    logs.push(`[SID] Step 1 passed. Action URL: ${action1}`);
 
-    match = html.match(/action="([^"]+)"/);
-    if (!match) throw new Error('Could not find form action');
-    const action1 = new URL(match[1], origin).href;
-
-    // Step 2: Submit first form
     const formData1 = new URLSearchParams({ '_wp_http': wp_http });
     response = await fetchWithRetry(action1, {
       method: 'POST',
@@ -256,21 +222,20 @@ async function resolveTechUnblockedLink(sidUrl) {
       body: formData1.toString(),
     });
 
-    // Step 3: Get verification form
     html = await response.text();
-    match = html.match(/name="_wp_http2"\s+value="([^"]+)"/);
-    if (!match) throw new Error('Could not find _wp_http2');
-    const wp_http2 = match[1];
+    $ = cheerio.load(html);
+    
+    const wp_http2 = $('input[name="_wp_http2"]').val();
+    const token = $('input[name="token"]').val();
+    let action2 = $('form').attr('action');
 
-    match = html.match(/name="token"\s+value="([^"]+)"/);
-    if (!match) throw new Error('Could not find token');
-    const token = match[1];
+    if (!wp_http2 || !token || !action2) {
+      logs.push(`[SID] ✗ Could not find secondary tokens _wp_http2 or token.`);
+      return null;
+    }
+    action2 = new URL(action2, origin).href;
+    logs.push(`[SID] Step 2 passed. Final action URL: ${action2}`);
 
-    match = html.match(/action="([^"]+)"/);
-    if (!match) throw new Error('Could not find verification form action');
-    const action2 = new URL(match[1], origin).href;
-
-    // Step 4: Submit verification
     const formData2 = new URLSearchParams({ '_wp_http2': wp_http2, token });
     response = await fetchWithRetry(action2, {
       method: 'POST',
@@ -281,35 +246,39 @@ async function resolveTechUnblockedLink(sidUrl) {
       body: formData2.toString(),
     });
 
-    // Step 5: Extract final URL from JavaScript
     html = await response.text();
-    match = html.match(/s_343\('([^']+)',\s*'([^']+)'/);
-    if (!match) throw new Error('Could not extract dynamic values from JS');
-    const cookieName = match[1];
-    const cookieValue = match[2];
-
-    match = html.match(/setAttribute\("href",\s*"([^"]+)"\)/);
-    if (!match) throw new Error('Could not extract final URL from JS');
-    const finalPath = match[1];
-
-    const finalUrl = new URL(finalPath, origin).href;
-    console.log(`[SID] ✓ Resolved to: ${finalUrl.substring(0, 80)}...`);
+    let match = html.match(/setAttribute\("href",\s*"([^"]+)"\)/);
+    
+    if (!match) {
+      logs.push(`[SID] ✗ JS execution payload missing setAttribute("href"). Checking fallback...`);
+      const redirectMatch = html.match(/window\.location\.replace\("([^"]+)"\)/);
+      if(redirectMatch) {
+          const finalUrl = new URL(redirectMatch[1], origin).href;
+          logs.push(`[SID] ✓ Resolved via window.location fallback: ${finalUrl}`);
+          return finalUrl;
+      }
+      return null;
+    }
+    
+    const finalUrl = new URL(match[1], origin).href;
+    logs.push(`[SID] ✓ Successfully resolved SID: ${finalUrl}`);
     return finalUrl;
   } catch (error) {
-    console.error(`[SID] ✗ Error:`, error.message);
+    logs.push(`[SID] ✗ Exception: ${error.message}`);
     return null;
   }
 }
 
-// Resolve intermediate links (dramadrip, modrefer, episodes.modpro.blog)
-async function resolveIntermediateLink(initialUrl, refererUrl, quality) {
+// Resolve intermediate routing domains (dramadrip, modrefer, modpro)
+async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
   try {
     const urlObject = new URL(initialUrl);
 
     if (urlObject.hostname.includes('dramadrip.com')) {
-      console.log(`[Dramadrip] Processing: ${initialUrl}`);
+      logs.push(`[Dramadrip] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
+      const $ = cheerio.load(html);
 
       let episodePageLink = null;
       const seasonMatch = quality.match(/Season\s+(\d+)/i);
@@ -319,190 +288,169 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality) {
         const qualityMatch = quality.match(/(1080p|720p|480p|2160p)/i);
         const targetQuality = qualityMatch ? qualityMatch[1].toLowerCase() : '';
 
-        const linkRegex = /<a\s+href=["']([^"']*(?:episodes\.modpro|cinematickit)[^"']*)["'][^>]*>([^<]+)<\/a>/gi;
-        let match;
-        while ((match = linkRegex.exec(html)) !== null) {
-          const link = match[1];
-          const text = match[2].toLowerCase();
+        $('a').each((_, el) => {
+          const a = $(el);
+          const link = a.attr('href') || '';
+          const text = a.text().toLowerCase();
           const headerMatch = html.match(new RegExp(seasonId + '[^<]*', 'i'));
           
-          if (targetQuality && text.includes(targetQuality) && headerMatch) {
-            episodePageLink = link;
-            break;
+          if (link.includes('episodes.modpro') || link.includes('cinematickit')) {
+            if (targetQuality && text.includes(targetQuality) && headerMatch) {
+              episodePageLink = link;
+            }
           }
-        }
+        });
       }
 
       if (!episodePageLink) {
-        const match = html.match(/<a\s+href=["']([^"']*(?:episodes\.modpro|cinematickit)[^"']*)/i);
-        episodePageLink = match ? match[1] : null;
+        episodePageLink = $('a[href*="episodes.modpro"], a[href*="cinematickit"]').first().attr('href') || null;
       }
 
       if (episodePageLink) {
-        return await resolveIntermediateLink(episodePageLink, initialUrl, quality);
+        logs.push(`[Dramadrip] Resolved to episode page, executing drill down.`);
+        return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logs);
       }
     } else if (urlObject.hostname.includes('episodes.modpro.blog') || urlObject.hostname.includes('cinematickit.org')) {
-      console.log(`[Episodes] Processing: ${initialUrl}`);
+      logs.push(`[Episodes] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
+      const $ = cheerio.load(html);
 
       const finalLinks = [];
-      const linkRegex = /<a\s+href=["']([^"']*driveseed[^"']*)["'][^>]*>([^<]+)<\/a>/gi;
-      let match;
-      
-      while ((match = linkRegex.exec(html)) !== null) {
+      $('a[href*="driveseed"]').each((_, el) => {
+        const a = $(el);
         finalLinks.push({
-          server: match[2].trim(),
-          url: match[1],
+          server: a.text().trim() || 'Driveseed',
+          url: a.attr('href'),
         });
-      }
+      });
+      logs.push(`[Episodes] Found ${finalLinks.length} links`);
       return finalLinks;
 
     } else if (urlObject.hostname.includes('modrefer.in') || urlObject.hostname.includes('links.modpro.blog')) {
-      console.log(`[ModRefer] Processing: ${initialUrl}`);
+      logs.push(`[ModRefer] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
+      const $ = cheerio.load(html);
 
       const finalLinks = [];
       
-      // Captures all content up to the closing tag across lines, bypassing nested constraints
-      const linkRegex = /<a\s+href=["']([^"']+?)["'][^>]*>([\s\S]*?)<\/a>/gi;
-      let match;
-      
-      while ((match = linkRegex.exec(html)) !== null) {
-        const url = match[1];
-        // Clean out child tags like <span> or <strong> to yield pure string descriptors
-        const text = match[2].replace(/<[^>]*>/g, '').trim();
+      $('a').each((_, el) => {
+        const a = $(el);
+        const url = a.attr('href');
+        const text = a.text().trim();
         
-        // Filter for actual download services (driveseed, cloud, etc)
-        if (url && (url.includes('driveseed') || url.includes('drive') || url.includes('cloud'))) {
+        if (url && (url.includes('driveseed') || url.includes('drive') || url.includes('cloud') || url.includes('unblockedgames') || url.includes('urlflix'))) {
           if (!text.toLowerCase().includes('comment')) {
             finalLinks.push({ 
               server: text || 'Direct Link', 
               url 
             });
+            logs.push(`[ModRefer] Extracted target server: ${text}`);
           }
         }
-      }
+      });
       
-      console.log(`[ModRefer] Found ${finalLinks.length} links`);
+      logs.push(`[ModRefer] Found ${finalLinks.length} valid routing links`);
       return finalLinks;
     }
 
     return [];
   } catch (error) {
-    console.error(`Error resolving intermediate link:`, error.message);
+    logs.push(`[Intermediate] ✗ Error: ${error.message}`);
     return [];
   }
 }
 
-// Resolve driveseed links
-async function resolveDriveseedLink(driveseedUrl) {
+// Resolve driveseed domains against JS challenge limits
+async function resolveDriveseedLink(driveseedUrl, logs) {
   try {
-    console.log(`[Driveseed] Resolving: ${driveseedUrl.substring(0, 80)}...`);
+    logs.push(`[Driveseed] Resolving: ${driveseedUrl}`);
     const response = await fetchWithRetry(driveseedUrl);
     const html = await response.text();
 
     const redirectMatch = html.match(/window\.location\.replace\("([^"]+)"\)/);
     if (!redirectMatch) {
-      console.log(`[Driveseed] No redirect found`);
+      logs.push(`[Driveseed] ✗ No redirect found`);
       return { downloadOptions: [], size: null, fileName: null };
     }
 
     const finalUrl = `https://driveseed.org${redirectMatch[1]}`;
+    logs.push(`[Driveseed] Following JS redirect to ${finalUrl}`);
     const finalResponse = await fetchWithRetry(finalUrl);
     const finalHtml = await finalResponse.text();
+    const $ = cheerio.load(finalHtml);
 
     const downloadOptions = [];
     
-    // Extract download buttons
-    const instantMatch = finalHtml.match(/<a[^>]*href=["']([^"']*(?:instant|video-seed)[^"']*)["'][^>]*>([^<]*Instant[^<]*)/i);
-    if (instantMatch) {
-      downloadOptions.push({
-        title: 'Instant Download',
-        type: 'instant',
-        url: instantMatch[1],
-        priority: 1,
-      });
-    }
+    $('a').each((_, el) => {
+      const a = $(el);
+      const href = a.attr('href') || '';
+      const text = a.text().toLowerCase();
+      
+      if (href.includes('instant') || href.includes('video-seed')) {
+        if (text.includes('instant')) {
+           downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
+        }
+      } else if (href.includes('resume')) {
+        downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
+      } else if (href.includes('worker')) {
+        downloadOptions.push({ title: 'Resume Worker Bot', type: 'worker', url: href, priority: 3 });
+      }
+    });
 
-    const resumeMatch = finalHtml.match(/<a[^>]*href=["']([^"']*resume[^"']*)["'][^>]*>([^<]*Resume[^<]*)/i);
-    if (resumeMatch) {
-      downloadOptions.push({
-        title: 'Resume Cloud',
-        type: 'resume',
-        url: resumeMatch[1],
-        priority: 2,
-      });
-    }
-
-    const workerMatch = finalHtml.match(/<a[^>]*href=["']([^"']*worker[^"']*)["'][^>]*>([^<]*Worker[^<]*)/i);
-    if (workerMatch) {
-      downloadOptions.push({
-        title: 'Resume Worker Bot',
-        type: 'worker',
-        url: workerMatch[1],
-        priority: 3,
-      });
-    }
-
-    // Extract size
+    let size = null;
+    let fileName = null;
+    
     const sizeMatch = finalHtml.match(/Size\s*:\s*([0-9.,]+\s*[KMGT]B)/i);
-    const size = sizeMatch ? sizeMatch[1] : null;
+    if (sizeMatch) size = sizeMatch[1];
 
-    // Extract filename
     const fileMatch = finalHtml.match(/Name\s*:\s*([^<]+)/i);
-    const fileName = fileMatch ? fileMatch[1].trim() : null;
+    if (fileMatch) fileName = fileMatch[1].trim();
 
     downloadOptions.sort((a, b) => a.priority - b.priority);
+    logs.push(`[Driveseed] ✓ Found ${downloadOptions.length} download options`);
     return { downloadOptions, size, fileName };
   } catch (error) {
-    console.error(`[Driveseed] Error:`, error.message);
+    logs.push(`[Driveseed] ✗ Error: ${error.message}`);
     return { downloadOptions: [], size: null, fileName: null };
   }
 }
 
-// Extract all downloadable links from a movie page
+// Main execution wrapper tying the resolution chains
 async function extractAllDownloadableLinks(moviePageUrl) {
+  const logs = [];
+  logs.push(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
   try {
-    console.log(`[Extract] Getting all downloadable links from: ${moviePageUrl}`);
-    const downloadLinks = await extractDownloadLinks(moviePageUrl);
+    const downloadLinks = await extractDownloadLinks(moviePageUrl, logs);
     
     if (downloadLinks.length === 0) {
-      console.log(`[Extract] No download links found`);
-      return [];
+      logs.push(`[Main] ✗ No initial download links found`);
+      return { links: [], logs };
     }
 
     const allDownloadableLinks = [];
 
     for (const link of downloadLinks.slice(0, 10)) {
       try {
-        console.log(`[Extract] Processing quality: ${link.quality}`);
+        logs.push(`[Main] Processing quality: ${link.quality}`);
         
-        // Skip 480p if you want (optional)
-        // if (link.quality.toLowerCase().includes('480p')) {
-        //   console.log(`[Extract] Skipping 480p: ${link.quality}`);
-        //   continue;
-        // }
-
-        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality);
+        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
         
         for (const targetLink of finalLinks) {
           try {
             let currentUrl = targetLink.url;
 
-            // Handle SID links safely across subdomain transitions (tech -> cloud)
-            if (currentUrl.includes('unblockedgames.world') || currentUrl.includes('tech.creativeexpressions')) {
-              console.log(`[Extract] Resolving SID link...`);
-              const resolvedSid = await resolveTechUnblockedLink(currentUrl);
+            if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
+              logs.push(`[Main] SID link detected, escalating to resolveTechUnblockedLink`);
+              const resolvedSid = await resolveTechUnblockedLink(currentUrl, logs);
               if (resolvedSid) {
                 currentUrl = resolvedSid;
               }
             }
 
-            // Resolve driveseed
-            if (currentUrl.includes('driveseed.org')) {
-              const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl);
+            if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
+              const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logs);
               
               for (const option of downloadOptions) {
                 allDownloadableLinks.push({
@@ -515,7 +463,6 @@ async function extractAllDownloadableLinks(moviePageUrl) {
                 });
               }
             } else {
-              // Direct link
               allDownloadableLinks.push({
                 quality: link.quality,
                 server: targetLink.server,
@@ -524,30 +471,29 @@ async function extractAllDownloadableLinks(moviePageUrl) {
               });
             }
           } catch (e) {
-            console.error(`[Extract] Error with ${targetLink.server}:`, e.message);
+             logs.push(`[Main] ✗ Error with ${targetLink.server}: ${e.message}`);
           }
         }
       } catch (e) {
-        console.error(`[Extract] Error with quality ${link.quality}:`, e.message);
+        logs.push(`[Main] ✗ Error with quality ${link.quality}: ${e.message}`);
       }
     }
 
-    console.log(`[Extract] ✓ Found ${allDownloadableLinks.length} total downloadable links`);
-    return allDownloadableLinks;
+    logs.push(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
+    return { links: allDownloadableLinks, logs };
   } catch (error) {
-    console.error(`[Extract] ✗ Error:`, error.message);
-    return [];
+    logs.push(`[Main] ✗ Fatal Error: ${error.message}`);
+    return { links: [], logs };
   }
 }
 
-// Stremio stream handler
+// Stremio HTTP server handler defining frontend layout
 async function handleRequest(request) {
   const url = new URL(request.url);
   let path = url.pathname;
   
   if (!path || path === '') path = '/';
 
-  // Root / search page
   if (path === '/' || path === '/search') {
     return new Response(`<!DOCTYPE html>
 <html lang="en">
@@ -571,129 +517,25 @@ async function handleRequest(request) {
       margin: 0 auto;
       box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
     }
-    h1 {
-      color: #333;
-      margin-bottom: 10px;
-      text-align: center;
-    }
-    .subtitle {
-      color: #666;
-      text-align: center;
-      margin-bottom: 30px;
-      font-size: 14px;
-    }
-    .search-box {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 30px;
-    }
-    input {
-      flex: 1;
-      padding: 12px 16px;
-      border: 2px solid #e0e0e0;
-      border-radius: 8px;
-      font-size: 16px;
-    }
-    input:focus {
-      outline: none;
-      border-color: #667eea;
-    }
-    button {
-      padding: 12px 30px;
-      background: #667eea;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-    }
-    button:hover {
-      background: #764ba2;
-    }
-    .two-column {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-      margin-top: 30px;
-    }
-    @media (max-width: 768px) {
-      .two-column {
-        grid-template-columns: 1fr;
-      }
-    }
-    .section {
-      background: #f9f9f9;
-      padding: 20px;
-      border-radius: 8px;
-      border: 1px solid #e0e0e0;
-    }
-    .section-title {
-      font-weight: 600;
-      color: #667eea;
-      margin-bottom: 15px;
-      font-size: 14px;
-      text-transform: uppercase;
-    }
-    .result-item {
-      background: white;
-      padding: 12px;
-      border-radius: 6px;
-      margin-bottom: 10px;
-      border-left: 3px solid #667eea;
-      word-break: break-word;
-    }
-    .result-title {
-      font-weight: 600;
-      color: #333;
-      margin-bottom: 6px;
-      font-size: 13px;
-    }
-    .result-url {
-      font-size: 11px;
-      color: #666;
-      font-family: monospace;
-      background: #f0f0f0;
-      padding: 6px;
-      border-radius: 4px;
-      margin-bottom: 6px;
-      display: block;
-      overflow-x: auto;
-    }
-    .result-meta {
-      font-size: 11px;
-      color: #999;
-      margin-top: 6px;
-    }
-    .copy-btn {
-      font-size: 10px;
-      padding: 4px 12px;
-      background: #e0e0e0;
-      color: #333;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    .copy-btn:hover {
-      background: #d0d0d0;
-    }
-    .loading {
-      text-align: center;
-      color: #666;
-      padding: 20px;
-    }
-    .error {
-      background: #fee;
-      color: #c33;
-      padding: 15px;
-      border-radius: 8px;
-      border-left: 4px solid #c33;
-      margin-top: 20px;
-    }
-    .empty {
-      text-align: center;
-      color: #999;
-      padding: 30px 20px;
-      font-size: 14px;
-    }
+    h1 { color: #333; margin-bottom: 10px; text-align: center; }
+    .subtitle { color: #666; text-align: center; margin-bottom: 30px; font-size: 14px; }
+    .search-box { display: flex; gap: 10px; margin-bottom: 30px; }
+    input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; }
+    input:focus { outline: none; border-color: #667eea; }
+    button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; }
+    button:hover { background: #764ba2; }
+    .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 30px; }
+    @media (max-width: 768px) { .two-column { grid-template-columns: 1fr; } }
+    .section { background: #f9f9f9; padding: 20px; border-radius: 8px; border: 1px solid #e0e0e0; }
+    .section-title { font-weight: 600; color: #667eea; margin-bottom: 15px; font-size: 14px; text-transform: uppercase; }
+    .result-item { background: white; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #667eea; word-break: break-word; }
+    .result-title { font-weight: 600; color: #333; margin-bottom: 6px; font-size: 13px; }
+    .result-url { font-size: 11px; color: #666; font-family: monospace; background: #f0f0f0; padding: 6px; border-radius: 4px; margin-bottom: 6px; display: block; overflow-x: auto; }
+    .copy-btn { font-size: 10px; padding: 4px 12px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer; }
+    .copy-btn:hover { background: #d0d0d0; }
+    .loading { text-align: center; color: #666; padding: 20px; }
+    .error { background: #fee; color: #c33; padding: 15px; border-radius: 8px; border-left: 4px solid #c33; margin-top: 20px; }
+    .empty { text-align: center; color: #999; padding: 30px 20px; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -725,6 +567,13 @@ async function handleRequest(request) {
         <div id="downloadResults" class="empty">Links appear here</div>
       </div>
     </div>
+
+    <div class="section" style="margin-top: 20px;">
+      <div class="section-title">🐛 Debug Logs</div>
+      <div id="debugLogs" style="font-family: monospace; font-size: 12px; background: #fff; padding: 15px; border-radius: 8px; border: 1px solid #e0e0e0; max-height: 400px; overflow-y: auto; color: #444; line-height: 1.5;">
+        Awaiting action...
+      </div>
+    </div>
   </div>
 
   <script>
@@ -734,14 +583,15 @@ async function handleRequest(request) {
 
       const pageDiv = document.getElementById('pageResults');
       const downloadDiv = document.getElementById('downloadResults');
+      const debugDiv = document.getElementById('debugLogs');
       const alertDiv = document.getElementById('alert');
       
       alertDiv.style.display = 'none';
       pageDiv.innerHTML = '<div class="loading">Searching movies...</div>';
       downloadDiv.innerHTML = '';
+      debugDiv.innerHTML = '<div class="loading">Awaiting trace logs...</div>';
 
       try {
-        // Get movie pages
         const pageResponse = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
         const pageData = await pageResponse.json();
 
@@ -750,7 +600,6 @@ async function handleRequest(request) {
           return;
         }
 
-        // Display movie pages
         pageDiv.innerHTML = pageData.results.map((r, i) => \`
           <div class="result-item">
             <div class="result-title">\${i + 1}. \${r.title}</div>
@@ -759,19 +608,26 @@ async function handleRequest(request) {
           </div>
         \`).join('');
 
-        // Extract download links
         downloadDiv.innerHTML = '<div class="loading">Extracting download links...</div>';
         
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
         const linksData = await linksResponse.json();
 
+        if (linksData.logs) {
+          debugDiv.innerHTML = linksData.logs.map(log => {
+             const isErr = log.includes('✗');
+             const isPass = log.includes('✓');
+             const color = isErr ? '#c33' : isPass ? '#2a9d8f' : '#444';
+             return \`<div style="color: \${color}; border-bottom: 1px solid #eee; padding-bottom: 2px; margin-bottom: 4px;">\${log}</div>\`;
+          }).join('');
+        }
+
         if (!linksData.links || linksData.links.length === 0) {
           downloadDiv.innerHTML = '<div class="empty">No downloadable links found</div>';
           return;
         }
 
-        // Group links by quality
         const grouped = {};
         linksData.links.forEach(link => {
           if (!grouped[link.quality]) grouped[link.quality] = [];
@@ -815,14 +671,12 @@ async function handleRequest(request) {
     });
   }
 
-  // Manifest
   if (path === '/manifest.json') {
     return new Response(JSON.stringify(MANIFEST), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });
   }
 
-  // Search API
   if (path === '/search-api') {
     const query = url.searchParams.get('q');
     if (!query) {
@@ -843,29 +697,26 @@ async function handleRequest(request) {
     }
   }
 
-  // Extract links API
   if (path === '/extract-links') {
     const pageUrl = url.searchParams.get('url');
     if (!pageUrl) {
-      return new Response(JSON.stringify({ links: [] }), {
+      return new Response(JSON.stringify({ links: [], logs: ['✗ No URL provided'] }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
     try {
-      const links = await extractAllDownloadableLinks(pageUrl);
-      return new Response(JSON.stringify({ links }), {
+      const result = await extractAllDownloadableLinks(pageUrl);
+      return new Response(JSON.stringify({ links: result.links, logs: result.logs }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     } catch (error) {
-      console.error(`Error extracting links:`, error.message);
-      return new Response(JSON.stringify({ links: [], error: error.message }), {
+      return new Response(JSON.stringify({ links: [], logs: [`✗ Fatal error: ${error.message}`] }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
   }
 
-  // Stremio stream endpoint
   const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
   if (streamMatch) {
     const type = streamMatch[1];
@@ -877,13 +728,10 @@ async function handleRequest(request) {
           headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
         });
       }
-
-      // For production, would need title from TMDB API
       return new Response(JSON.stringify({ streams: [] }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     } catch (error) {
-      console.error(`Stream error:`, error.message);
       return new Response(JSON.stringify({ streams: [] }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
@@ -893,7 +741,6 @@ async function handleRequest(request) {
   return new Response('Not Found', { status: 404 });
 }
 
-// Cloudflare Workers entry
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
