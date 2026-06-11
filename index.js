@@ -14,7 +14,7 @@ const MANIFEST = {
 };
 
 const TMDB_API_BASE = 'https://api.themoviedb.org/3';
-const MOVIESMOD_BASE = 'https://moviesmod.day'; // adjust domain as needed
+const MOVIESMOD_BASE = 'https://moviesmod.money'; // adjust domain as needed
 
 /**
  * Fetch from external API with timeout and retries
