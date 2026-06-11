@@ -370,7 +370,7 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
   }
 }
 
-// Main execution wrapper tying the resolution chains concurrently
+// Main execution wrapper tying the resolution chains sequentially
 async function extractAllDownloadableLinks(moviePageUrl) {
   const logs = [];
   logs.push(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
@@ -384,8 +384,8 @@ async function extractAllDownloadableLinks(moviePageUrl) {
 
     const allDownloadableLinks = [];
 
-    // Run map concurrently to defeat overall worker timeouts (30s limit)
-    const extractionPromises = downloadLinks.slice(0, 6).map(async (link) => {
+    // Process sequentially: evaluate one quality entirely before advancing
+    for (const link of downloadLinks.slice(0, 6)) {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
@@ -440,10 +440,7 @@ async function extractAllDownloadableLinks(moviePageUrl) {
       } catch (e) {
         logs.push(`[Main] ✗ Quality Parse Error (${link.quality}): ${e.message}`);
       }
-    });
-
-    // Await all concurrent quality extractions
-    await Promise.all(extractionPromises);
+    }
 
     logs.push(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
     return { links: allDownloadableLinks, logs };
@@ -452,6 +449,7 @@ async function extractAllDownloadableLinks(moviePageUrl) {
     return { links: [], logs };
   }
 }
+
 
 // Stremio HTTP server handler defining frontend layout
 async function handleRequest(request) {
