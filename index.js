@@ -2,9 +2,9 @@ import puppeteer from "@cloudflare/puppeteer";
 
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.5.0',
+  version: '0.6.0',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams using Cloudflare Headless Chromium',
+  description: 'Extracts HTTP streams using Cloudflare Headless Chromium (SSE Streaming)',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -87,15 +87,18 @@ async function searchMoviesMod(query) {
   }
 }
 
-async function extractDownloadLinks(moviePageUrl, logs) {
+async function extractDownloadLinks(moviePageUrl, logger) {
   try {
-    logs.push(`[Extract] Fetching movie page: ${moviePageUrl}`);
+    await logger(`[Extract] Fetching movie page: ${moviePageUrl}`);
     const response = await fetchWithRetry(moviePageUrl);
     const html = await response.text();
 
     const links = [];
     const contentMatch = html.match(/class=["'][^"']*thecontent[^"']*["'][^>]*>([\s\S]*?)(?:<div class="post-navigation"|<h4 class="total-comments"|<\/article>|<div id="comments")/i);
-    if (!contentMatch) return links;
+    if (!contentMatch) {
+      await logger('[Extract] ✗ No .thecontent div found');
+      return links;
+    }
 
     const blocks = contentMatch[1].split(/(?=<h[2-6])/i);
     
@@ -122,19 +125,20 @@ async function extractDownloadLinks(moviePageUrl, logs) {
         }
       }
     }
-    logs.push(`[Extract] Found ${links.length} download links`);
+    await logger(`[Extract] Found ${links.length} download links`);
     return links;
   } catch (error) {
+    await logger(`[Extract] ✗ Error extracting download links: ${error.message}`);
     return [];
   }
 }
 
 // Headless Chromium Engine bypassing JS checks, Cookies, and Timers automatically
-async function resolveTechUnblockedLink(sidUrl, logs, env) {
-  logs.push(`[SID] Resolving payload using Cloudflare Browser Binding for: ${sidUrl}`);
+async function resolveTechUnblockedLink(sidUrl, env, logger) {
+  await logger(`[SID] Resolving payload using Cloudflare Browser Binding for: ${sidUrl}`);
   
   if (!env.MYBROWSER) {
-    logs.push(`[SID] ✗ ERROR: Browser binding 'MYBROWSER' not found in wrangler.toml`);
+    await logger(`[SID] ✗ ERROR: Browser binding 'MYBROWSER' not found in wrangler.toml`);
     return null;
   }
 
@@ -143,7 +147,7 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
     browser = await puppeteer.launch(env.MYBROWSER);
     const page = await browser.newPage();
     
-    // Block unnecessary network resources to drastically speed up page evaluation
+    // Block unnecessary network resources to drastically speed up page evaluation and save RAM
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const rt = req.resourceType();
@@ -154,12 +158,12 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
       }
     });
 
-    logs.push(`[SID] Chromium launched. Navigating to root...`);
-    await page.goto(sidUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await logger(`[SID] Chromium launched. Navigating to root...`);
+    await page.goto(sidUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
 
     let finalUrl = null;
 
-    // Track targets in case the Safelink forces the "Go to Download" link into a new tab (target="_blank")
+    // Track targets in case the Safelink forces the jump link into a new tab (target="_blank")
     browser.on('targetcreated', async (target) => {
       const newTabUrl = target.url();
       if (newTabUrl.includes('driveseed.org') || newTabUrl.includes('driveseed')) {
@@ -168,14 +172,15 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
     });
 
     // Inject an intelligent auto-clicker loop directly into the browser DOM
-    page.evaluate(async () => {
+    // Detached from main thread to prevent 30s timeout blocking
+    const domBypass = page.evaluate(async () => {
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       
       // Attempt to neutralize standard JS timers
       if (typeof timer !== 'undefined') window.timer = 0;
       if (typeof time !== 'undefined') window.time = 0;
 
-      for (let i = 0; i < 25; i++) {
+      for (let i = 0; i < 15; i++) {
         const elements = Array.from(document.querySelectorAll('a, button, input[type="submit"], .btn'));
         const keywords = ['start verification', 'verify to continue', 'click here to continue', 'go to download', 'continue'];
         
@@ -184,7 +189,6 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
           const isVisible = el.offsetWidth > 0 && el.offsetHeight > 0 && window.getComputedStyle(el).display !== 'none';
           
           if (isVisible && keywords.some(k => text.includes(k))) {
-            // Prevent clicking if the button text explicitly tells the user to wait
             if (!text.includes('wait') && !text.includes('second')) {
               el.scrollIntoView();
               el.click();
@@ -192,7 +196,7 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
             }
           }
           
-          // Fallback checking by common Safelink IDs
+          // Fallback checking by common Safelink DOM IDs
           if (isVisible && ['verify_button', 'generate_link', 'go_download'].includes(el.id)) {
             el.scrollIntoView();
             el.click();
@@ -201,11 +205,12 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
         }
         await sleep(1000);
       }
-    });
+    }).catch(() => {});
 
-    // Node.js Event Loop Polling: Wait up to 22 seconds for the script to navigate to DriveSeed
-    logs.push(`[SID] Auto-clicker injected. Waiting for verification progression...`);
-    for (let i = 0; i < 22; i++) {
+    await logger(`[SID] Auto-clicker injected. Waiting for verification progression...`);
+    
+    // Node.js Event Loop Polling: Wait up to 18 seconds for the script to navigate to DriveSeed
+    for (let i = 0; i < 18; i++) {
       if (finalUrl) break;
       
       const currentUrl = page.url();
@@ -214,7 +219,7 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
         break;
       }
 
-      // Check the raw DOM just in case the link generated visually but failed to execute JS navigation
+      // Read raw DOM to catch links generated visually without native JS location hooks
       const htmlContent = await page.content().catch(() => '');
       const domMatch = htmlContent.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
       if (domMatch) {
@@ -226,21 +231,21 @@ async function resolveTechUnblockedLink(sidUrl, logs, env) {
     }
 
     if (finalUrl) {
-      logs.push(`[SID] ✓ Headless Engine Successfully bypassed to: ${finalUrl}`);
+      await logger(`[SID] ✓ Headless Engine successfully bypassed to: ${finalUrl}`);
       return finalUrl;
     } else {
-      logs.push(`[SID] ✗ Browser timed out before reaching destination.`);
+      await logger(`[SID] ✗ Browser timed out before reaching destination.`);
       return null;
     }
   } catch (error) {
-    logs.push(`[SID] ✗ Puppeteer Exception: ${error.message}`);
+    await logger(`[SID] ✗ Puppeteer Exception: ${error.message}`);
     return null;
   } finally {
     if (browser) await browser.close();
   }
 }
 
-async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
+async function resolveIntermediateLink(initialUrl, refererUrl, quality, logger) {
   try {
     const urlObject = new URL(initialUrl);
     const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -257,7 +262,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
           break;
         }
       }
-      if (episodePageLink) return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logs);
+      if (episodePageLink) return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logger);
     } else if (urlObject.hostname.includes('episodes.modpro.blog') || urlObject.hostname.includes('cinematickit.org')) {
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
@@ -279,7 +284,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
           if (!text.toLowerCase().includes('comment')) finalLinks.push({ server: text || 'Direct Link', url });
         }
       }
-      logs.push(`[ModRefer] Found ${finalLinks.length} routing links.`);
+      await logger(`[ModRefer] Found ${finalLinks.length} routing links.`);
       return finalLinks;
     }
     return [];
@@ -288,9 +293,9 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
   }
 }
 
-async function resolveDriveseedLink(driveseedUrl, logs) {
+async function resolveDriveseedLink(driveseedUrl, logger) {
   try {
-    logs.push(`[Driveseed] Resolving: ${driveseedUrl}`);
+    await logger(`[Driveseed] Resolving: ${driveseedUrl}`);
     const response = await fetchWithRetry(driveseedUrl);
     let finalHtml = await response.text();
 
@@ -322,28 +327,30 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
     const fileName = getMatch(finalHtml, /Name\s*:\s*([^<]+)/i, 1)?.trim() || null;
 
     downloadOptions.sort((a, b) => a.priority - b.priority);
-    logs.push(`[Driveseed] ✓ Found ${downloadOptions.length} download options`);
+    await logger(`[Driveseed] ✓ Found ${downloadOptions.length} download options`);
     return { downloadOptions, size, fileName };
   } catch (error) {
-    logs.push(`[Driveseed] ✗ Error: ${error.message}`);
+    await logger(`[Driveseed] ✗ Error: ${error.message}`);
     return { downloadOptions: [], size: null, fileName: null };
   }
 }
 
-async function extractAllDownloadableLinks(moviePageUrl, env) {
-  const logs = [];
-  logs.push(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
+async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
+  await logger(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
   try {
-    const downloadLinks = await extractDownloadLinks(moviePageUrl, logs);
-    if (downloadLinks.length === 0) return { links: [], logs };
+    const downloadLinks = await extractDownloadLinks(moviePageUrl, logger);
+    if (downloadLinks.length === 0) {
+      await logger(`[Main] ✗ No initial download links found`);
+      return { links: [] };
+    }
 
     const allDownloadableLinks = [];
 
     // LIMIT TO EXACTLY 1 QUALITY to ensure Cloudflare Puppeteer timeout boundaries are respected
     for (const link of downloadLinks.slice(0, 1)) {
       try {
-        logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
-        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
+        await logger(`[Main] Evaluating quality layer: ${link.quality}`);
+        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logger);
         
         const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
         const targetsToProcess = primaryTarget ? [primaryTarget] : [];
@@ -353,12 +360,12 @@ async function extractAllDownloadableLinks(moviePageUrl, env) {
             let currentUrl = targetLink.url;
 
             if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
-              const resolvedSid = await resolveTechUnblockedLink(currentUrl, logs, env);
+              const resolvedSid = await resolveTechUnblockedLink(currentUrl, env, logger);
               if (resolvedSid) currentUrl = resolvedSid;
             }
 
             if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
-              const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logs);
+              const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logger);
               for (const option of downloadOptions) {
                 allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: option.title, url: option.url, size, fileName });
               }
@@ -366,23 +373,23 @@ async function extractAllDownloadableLinks(moviePageUrl, env) {
               allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: 'Direct Link', url: currentUrl });
             }
           } catch (e) {
-             logs.push(`[Main] ✗ TargetLink Error (${targetLink.server}): ${e.message}`);
+             await logger(`[Main] ✗ TargetLink Error (${targetLink.server}): ${e.message}`);
           }
         }
       } catch (e) {
-        logs.push(`[Main] ✗ Quality Parse Error (${link.quality}): ${e.message}`);
+        await logger(`[Main] ✗ Quality Parse Error (${link.quality}): ${e.message}`);
       }
     }
 
-    logs.push(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
-    return { links: allDownloadableLinks, logs };
+    await logger(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
+    return { links: allDownloadableLinks };
   } catch (error) {
-    logs.push(`[Main] ✗ Fatal Error: ${error.message}`);
-    return { links: [], logs };
+    await logger(`[Main] ✗ Fatal Error: ${error.message}`);
+    return { links: [] };
   }
 }
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   let path = url.pathname || '/';
 
@@ -418,7 +425,7 @@ async function handleRequest(request, env) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (Cloudflare Headless Browser Engine)</p>
+    <p class="subtitle">Search & Extract Direct Download Links (Real-Time SSE & Chromium Bypass)</p>
     
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
@@ -448,9 +455,13 @@ async function handleRequest(request, env) {
   </div>
 
   <script>
+    let activeStream = null;
+
     async function search() {
       const query = document.getElementById('searchInput').value.trim();
       if (!query) return;
+
+      if (activeStream) activeStream.close();
 
       document.getElementById('alert').style.display = 'none';
       document.getElementById('pageResults').innerHTML = '<div class="loading">Searching movies...</div>';
@@ -474,49 +485,66 @@ async function handleRequest(request, env) {
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Spinning up Chromium bypass (takes 15-20 seconds)...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Stream active. Bypassing Safelink via Chromium...</div>';
         
         const firstResult = pageData.results[0];
-        const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
-        const linksData = await linksResponse.json();
+        const eventSource = new EventSource(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
+        activeStream = eventSource;
 
-        if (linksData.logs) {
-          document.getElementById('debugLogs').innerHTML = linksData.logs.map(log => {
+        eventSource.onmessage = function(event) {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'log') {
+             const log = data.message;
              const isErr = log.includes('✗');
              const isPass = log.includes('✓') || log.includes('⚠️');
              const color = isErr ? '#c33' : isPass ? '#2a9d8f' : '#444';
-             return \`<div style="color: \${color}; border-bottom: 1px solid #eee; padding-bottom: 2px; margin-bottom: 4px;">\${log}</div>\`;
-          }).join('');
-        }
+             const debugDiv = document.getElementById('debugLogs');
+             if (debugDiv.innerHTML.includes('Awaiting trace logs...')) debugDiv.innerHTML = '';
+             debugDiv.innerHTML += \`<div style="color: \${color}; border-bottom: 1px solid #eee; padding-bottom: 2px; margin-bottom: 4px;">\${log}</div>\`;
+             debugDiv.scrollTop = debugDiv.scrollHeight;
+          } 
+          
+          if (data.type === 'result') {
+             eventSource.close();
+             const links = data.links;
+             if (!links || links.length === 0) {
+               document.getElementById('downloadResults').innerHTML = '<div class="empty">No downloadable links found</div>';
+               return;
+             }
 
-        if (!linksData.links || linksData.links.length === 0) {
-          document.getElementById('downloadResults').innerHTML = '<div class="empty">No downloadable links found</div>';
-          return;
-        }
+             const grouped = {};
+             links.forEach(link => {
+               if (!grouped[link.quality]) grouped[link.quality] = [];
+               grouped[link.quality].push(link);
+             });
 
-        const grouped = {};
-        linksData.links.forEach(link => {
-          if (!grouped[link.quality]) grouped[link.quality] = [];
-          grouped[link.quality].push(link);
-        });
+             let html = '';
+             Object.keys(grouped).forEach(quality => {
+               html += \`<div style="margin-bottom: 15px;"><div class="result-title">\${quality}</div>\`;
+               grouped[quality].forEach(link => {
+                 html += \`<div style="margin-left: 10px; margin-bottom: 8px;">
+                   <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
+                     📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
+                   </div>
+                   <span class="result-url">\${link.url}</span>
+                   <button class="copy-btn" onclick="window.open('\${link.url}', '_blank')">Open</button>
+                   <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
+                 </div>\`;
+               });
+               html += '</div>';
+             });
 
-        let html = '';
-        Object.keys(grouped).forEach(quality => {
-          html += \`<div style="margin-bottom: 15px;"><div class="result-title">\${quality}</div>\`;
-          grouped[quality].forEach(link => {
-            html += \`<div style="margin-left: 10px; margin-bottom: 8px;">
-              <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
-                📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
-              </div>
-              <span class="result-url">\${link.url}</span>
-              <button class="copy-btn" onclick="window.open('\${link.url}', '_blank')">Open</button>
-              <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
-            </div>\`;
-          });
-          html += '</div>';
-        });
+             document.getElementById('downloadResults').innerHTML = html;
+          }
+        };
 
-        document.getElementById('downloadResults').innerHTML = html;
+        eventSource.onerror = function() {
+           eventSource.close();
+           document.getElementById('alert').textContent = \`Connection stream closed. Ensure you are running with --remote if testing locally.\`;
+           document.getElementById('alert').style.display = 'block';
+        };
+
       } catch (error) {
         document.getElementById('alert').textContent = \`Error: \${error.message}\`;
         document.getElementById('alert').style.display = 'block';
@@ -552,15 +580,39 @@ async function handleRequest(request, env) {
 
   if (path === '/extract-links') {
     const pageUrl = url.searchParams.get('url');
-    if (!pageUrl) return new Response(JSON.stringify({ links: [], logs: ['✗ No URL provided'] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+    if (!pageUrl) return new Response("Missing URL", { status: 400 });
 
-    try {
-      // Pass the Cloudflare env to the extractor so the Browser Binding can be initialized
-      const result = await extractAllDownloadableLinks(pageUrl, env);
-      return new Response(JSON.stringify({ links: result.links, logs: result.logs }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-    } catch (error) {
-      return new Response(JSON.stringify({ links: [], logs: [`✗ Fatal error: ${error.message}`] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-    }
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    const streamLogger = async (msg) => {
+      try {
+        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'log', message: msg })}\n\n`));
+      } catch (e) {} // Ignore closed stream errors
+    };
+
+    // Use ctx.waitUntil to safely execute the scraper while returning the open stream
+    ctx.waitUntil((async () => {
+      try {
+        const result = await extractAllDownloadableLinks(pageUrl, env, streamLogger);
+        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'result', links: result.links })}\n\n`));
+      } catch (error) {
+        await streamLogger(`[Main] ✗ Fatal Error: ${error.message}`);
+        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'result', links: [] })}\n\n`));
+      } finally {
+        await writer.close();
+      }
+    })());
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
   }
 
   return new Response('Not Found', { status: 404 });
@@ -573,7 +625,7 @@ export default {
     }
 
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Worker error:', error);
       return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
