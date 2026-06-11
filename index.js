@@ -159,17 +159,21 @@ async function extractDownloadLinks(moviePageUrl, logs) {
   }
 }
 
-// Resolves payload via virtual cookie injection and automated redirect tracking
 async function resolveTechUnblockedLink(sidUrl, logs) {
-  logs.push(`[SID] Resolving payload for: ${sidUrl}`);
+  logs.push(`[TechUnblocked] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
-  
-  const cookieMap = new Map();
-  // Pre-seed the cookie map to spoof a valid PHP session
-  cookieMap.set('PHPSESSID', Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
-  cookieMap.set('cf_clearance', Math.random().toString(36).substring(2, 15));
 
-  function extractCookies(res, htmlBody) {
+  const cookieMap = new Map();
+  // Pre-seed a PHP session ID
+  cookieMap.set('PHPSESSID', Math.random().toString(36).substring(2, 15));
+
+  function buildCookieHeader() {
+    return Array.from(cookieMap.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+  }
+
+  function extractCookies(res) {
     try {
       let headerCookies = [];
       if (typeof res.headers.getSetCookie === 'function') {
@@ -178,148 +182,155 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
         const sc = res.headers.get('set-cookie');
         if (sc) headerCookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
       }
-
       if (Array.isArray(headerCookies)) {
         headerCookies.forEach(c => {
           const pair = c.split(';')[0].trim();
-          const splitIndex = pair.indexOf('=');
-          if (splitIndex !== -1) {
-            const k = pair.slice(0, splitIndex).trim();
-            const v = pair.slice(splitIndex + 1).trim();
-            if (k && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly'].includes(k.toLowerCase())) {
+          const idx = pair.indexOf('=');
+          if (idx !== -1) {
+            const k = pair.slice(0, idx).trim();
+            const v = pair.slice(idx + 1).trim();
+            if (k && !['path','expires','domain','samesite','secure','httponly','max-age'].includes(k.toLowerCase())) {
               cookieMap.set(k, v);
             }
           }
         });
       }
-
-      if (htmlBody) {
-        const jsRegex = /document\.cookie\s*=\s*(['"`])([^`'"]+)\1/gi;
-        let match;
-        while ((match = jsRegex.exec(htmlBody)) !== null) {
-          const pair = match[2].split(';')[0].trim();
-          const splitIndex = pair.indexOf('=');
-          if (splitIndex !== -1) {
-            const k = pair.slice(0, splitIndex).trim();
-            const v = pair.slice(splitIndex + 1).trim();
-            if (k) cookieMap.set(k, v);
-          }
-        }
-      }
+      logs.push(`[TechUnblocked] Cookies after extract: ${Array.from(cookieMap.keys()).join(', ')}`);
     } catch (e) {
-       logs.push(`[SID] Warning: Cookie parsing error: ${e.message}`);
+      logs.push(`[TechUnblocked] Cookie parse warning: ${e.message}`);
     }
   }
 
-  function getHeaders(referer) {
-    const headers = { 
+  async function doFetch(url, opts = {}) {
+    const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.5',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': referer ? 'same-origin' : 'cross-site',
-      'Upgrade-Insecure-Requests': '1'
+      'Upgrade-Insecure-Requests': '1',
+      ...(opts.headers || {}),
     };
-    if (referer) headers['Referer'] = referer;
     if (cookieMap.size > 0) {
-      headers['Cookie'] = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+      headers['Cookie'] = buildCookieHeader();
     }
-    return headers;
+    return await fetchWithRetry(url, { ...opts, headers, redirect: 'manual' });
   }
 
   try {
-    let response = await fetchWithRetry(sidUrl, { headers: getHeaders(), redirect: 'manual' });
-    let html = await response.text();
-    extractCookies(response, html);
+    // -------------------------------------------------
+    // STEP 1: Initial landing — submit #landing form
+    // -------------------------------------------------
+    logs.push(`[TechUnblocked] Step 1 — Loading SID page`);
+    let resp = await doFetch(sidUrl);
+    let html = await resp.text();
+    extractCookies(resp);
     
-    let wp_http = getMatch(html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
-    let action1 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
-    
-    if (!wp_http || !action1) {
-      logs.push(`[SID] ✗ Could not find initial token _wp_http or form action.`);
+    // Find the #landing form and POST it
+    const landingAction = getMatch(html, /<form[^>]+id=["']landing["'][^>]*action=["']([^"']+)["']/i)
+                       || getMatch(html, /<form[^>]+action=["']([^"']+)["'][^>]*id=["']landing["']/i);
+    const wpHttp = getMatch(html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i);
+
+    if (!landingAction || !wpHttp) {
+      logs.push(`[TechUnblocked] ✗ Could not find landing form or _wp_http token`);
       return null;
     }
-    const action1Url = new URL(action1, origin).href;
 
-    const formData1 = new URLSearchParams({ '_wp_http': wp_http });
-    response = await fetchWithRetry(action1Url, {
+    logs.push(`[TechUnblocked] Submitting #landing form to: ${landingAction}`);
+    const landingUrl = new URL(landingAction, origin).href;
+    resp = await doFetch(landingUrl, {
       method: 'POST',
-      headers: { ...getHeaders(sidUrl), 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formData1.toString(),
-      redirect: 'manual'
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': sidUrl },
+      body: new URLSearchParams({ '_wp_http': wpHttp }).toString(),
     });
-    html = await response.text();
-    extractCookies(response, html);
-    
-    let wp_http2 = getMatch(html, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
-    let token = getMatch(html, /name=["']token["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']token["']/i);
-    let action2 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
+    html = await resp.text();
+    extractCookies(resp);
 
-    if (!wp_http2 || !token || !action2) {
-      logs.push(`[SID] ✗ Could not find secondary tokens _wp_http2 or token.`);
+    // -------------------------------------------------
+    // STEP 2: Click #verify_button
+    // -------------------------------------------------
+    logs.push(`[TechUnblocked] Step 2 — Looking for #verify_button`);
+
+    const verifyAction = getMatch(html, /<form[^>]+id=["']verify["'][^>]*action=["']([^"']+)["']/i)
+                       || getMatch(html, /<form[^>]+action=["']([^"']+)["'][^>]*id=["']verify["']/i);
+    const wpHttp2 = getMatch(html, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i);
+    const token = getMatch(html, /name=["']token["']\s+value=["']([^"']+)["']/i);
+
+    if (!verifyAction || !wpHttp2 || !token) {
+      logs.push(`[TechUnblocked] Could not find verify form / tokens`);
       return null;
     }
-    const action2Url = new URL(action2, origin).href;
 
-    const formData2 = new URLSearchParams({ '_wp_http2': wp_http2, token });
-    response = await fetchWithRetry(action2Url, {
+    logs.push(`[TechUnblocked] Submitting verify form to: ${verifyAction}`);
+    const verifyUrl = new URL(verifyAction, origin).href;
+    resp = await doFetch(verifyUrl, {
       method: 'POST',
-      headers: { ...getHeaders(action1Url), 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formData2.toString(),
-      redirect: 'manual'
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': landingUrl },
+      body: new URLSearchParams({ '_wp_http2': wpHttp2, token }).toString(),
     });
-    html = await response.text();
-    extractCookies(response, html);
-    
-    let matchUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+)"\)/);
-    if (!matchUrl) {
-      const fallbackUrl = getMatch(html, /window\.location\.replace\("([^"]+)"\)/);
-      if(!fallbackUrl) {
-         logs.push(`[SID] ✗ No jump link generated in payload.`);
-         return null;
+    html = await resp.text();
+    extractCookies(resp);
+
+    // -------------------------------------------------
+    // STEP 3: Read #two_steps_btn href (the ?go= link)
+    // -------------------------------------------------
+    logs.push(`[TechUnblocked] Step 3 — Looking for #two_steps_btn href`);
+
+    // The href may be injected by JS, but sometimes it's embedded in the HTML
+    let goUrl = getMatch(html, /<a[^>]+id=["']two_steps_btn["'][^>]+href=["']([^"']+)["']/i)
+             || getMatch(html, /id=["']two_steps_btn["'][^>]+href=["']([^"']+)["']/i)
+             || getMatch(html, /<a[^>]+id=["']two_steps_btn["']/i); // Check if element exists
+
+    if (!goUrl || goUrl === '' || html.includes('id="two_steps_btn"')) {
+      // The href might be empty and populated via JS; try to find the go URL embedded in the page
+      logs.push(`[TechUnblocked] #two_steps_btn href empty or not found, searching JS for go URL`);
+      
+      // Look for the ?go= link in inline JS or data attributes
+      goUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+\?go=[^"]+)"\)/i)
+           || getMatch(html, /href\s*=\s*"([^"]+\?go=[^"]+)"[^>]*id="two_steps_btn"/i)
+           || getMatch(html, /"([^"]+\?go=[^"]+)"[^>]*id="two_steps_btn"/i)
+           || getMatch(html, /data-href\s*=\s*"([^"]+\?go=[^"]+)"[^>]*id="two_steps_btn"/i);
+      
+      // If still nothing, try to find ANY ?go= link on the page
+      if (!goUrl) {
+        goUrl = getMatch(html, /\?go=([a-zA-Z0-9-]+)/);
+        if (goUrl) {
+          goUrl = origin + '/?go=' + goUrl;
+        }
       }
-      matchUrl = fallbackUrl;
-    }
-    
-    const intermediateUrl = new URL(matchUrl, origin).href;
-    logs.push(`[SID] Intermediary URL extracted. Waiting 8s to clear velocity timer...`);
 
-    await new Promise(r => setTimeout(r, 8000));
-
-    // Allow fetch to transparently follow the 302 location to DriveSeed
-    const redirectRes = await fetch(intermediateUrl, {
-      method: 'GET',
-      headers: getHeaders(action2Url),
-      redirect: 'follow' 
-    });
-    
-    let finalUrl = redirectRes.url;
-
-    // Fallback if it landed on an intermediate page without an HTTP status redirect
-    if (finalUrl === intermediateUrl || finalUrl.includes('?go=')) {
-      const redirectHtml = await redirectRes.text();
-      if (redirectHtml.includes("Bad Request")) {
-        logs.push(`[SID] ✗ Target returned Bad Request despite wait limit. Cookie map size: ${cookieMap.size}`);
+      if (!goUrl) {
+        logs.push(`[TechUnblocked] ✗ Could not extract go URL`);
         return null;
       }
-      const jsRedirectMatch = getMatch(redirectHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
-      const metaRedirectMatch = getMatch(redirectHtml, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[^"']*url=([^"']+)["']?/i);
-      
-      if (jsRedirectMatch) {
-         finalUrl = new URL(jsRedirectMatch, intermediateUrl).href;
-      } else if (metaRedirectMatch) {
-         finalUrl = new URL(metaRedirectMatch, intermediateUrl).href;
+    }
+
+    const fullGoUrl = goUrl.startsWith('http') ? goUrl : new URL(goUrl, origin).href;
+    logs.push(`[TechUnblocked] ✓ Go URL extracted: ${fullGoUrl}`);
+
+    // -------------------------------------------------
+    // STEP 4: Follow the ?go= redirect to driveseed
+    // -------------------------------------------------
+    logs.push(`[TechUnblocked] Step 4 — Following go URL to final destination`);
+    
+    const goResp = await doFetch(fullGoUrl, { redirect: 'follow' });
+    let finalUrl = goResp.url;
+
+    // If we landed back on unblockedgames (JS redirect), try to find the real destination
+    if (finalUrl.includes('unblockedgames') && !finalUrl.includes('driveseed')) {
+      const goHtml = await goResp.text();
+      const jsRedirect = getMatch(goHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i)
+                      || getMatch(goHtml, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[^"']*url=([^"']+)["']?/i);
+      if (jsRedirect) {
+        finalUrl = new URL(jsRedirect, finalUrl).href;
       } else {
-         logs.push(`[SID] ✗ Target failed to provide JS redirect.`);
-         return null;
+        logs.push(`[TechUnblocked] No redirect found after go URL`);
+        return null;
       }
     }
 
-    logs.push(`[SID] ✓ Successfully resolved SID path to: ${finalUrl}`);
+    logs.push(`[TechUnblocked] ✓ Final destination: ${finalUrl}`);
     return finalUrl;
   } catch (error) {
-    logs.push(`[SID] ✗ Exception: ${error.message}`);
+    logs.push(`[TechUnblocked] ✗ Exception: ${error.message}`);
     return null;
   }
 }
