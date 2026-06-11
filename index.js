@@ -144,7 +144,9 @@ async function resolveTechUnblockedLink(sidUrl, env, logger) {
 
   let browser;
   try {
-    browser = await puppeteer.launch(env.MYBROWSER);
+    browser = await puppeteer.launch(env.MYBROWSER, {
+      protocolTimeout: 100000, 
+    });;
     const page = await browser.newPage();
     
     // Block unnecessary network resources to drastically speed up page evaluation and save RAM
