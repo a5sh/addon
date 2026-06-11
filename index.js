@@ -116,67 +116,7 @@ async function handleRequest(request) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  if (path === '/manifest.json') {
-    return new Response(JSON.stringify(MANIFEST), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-
-  const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
-  if (streamMatch) {
-    const type = streamMatch[1];
-    const id = streamMatch[2];
-
-    try {
-      if (!id.startsWith('tt') && !id.startsWith('tmdb:')) {
-        return new Response(JSON.stringify({ streams: [] }), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
-      }
-
-      const results = await searchMoviesMod(id);
-      if (!results.length) {
-        return new Response(JSON.stringify({ streams: [] }), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
-      }
-
-      const pageResponse = await fetchWithRetry(results[0].url);
-      const pageHtml = await pageResponse.text();
-      const streamUrls = await extractStreamsFromPage(pageHtml, results[0].url);
-
-      const streams = streamUrls.map((url, index) => ({
-        url,
-        title: `${results[0].title} [${index + 1}]`,
-      }));
-
-      return new Response(JSON.stringify({ streams }), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-    } catch (error) {
-      console.error(`Stream error: ${error.message}`);
-      return new Response(JSON.stringify({ streams: [] }), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-    }
-  }
-
-  if (path === '/' || path === '/search') {
+  if (path === '/' || path === '/search' || path === '') {
     return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -361,6 +301,66 @@ async function handleRequest(request) {
 </html>`, {
       headers: { 'Content-Type': 'text/html' },
     });
+  }
+
+  if (path === '/manifest.json') {
+    return new Response(JSON.stringify(MANIFEST), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+
+  const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
+  if (streamMatch) {
+    const type = streamMatch[1];
+    const id = streamMatch[2];
+
+    try {
+      if (!id.startsWith('tt') && !id.startsWith('tmdb:')) {
+        return new Response(JSON.stringify({ streams: [] }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+
+      const results = await searchMoviesMod(id);
+      if (!results.length) {
+        return new Response(JSON.stringify({ streams: [] }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+
+      const pageResponse = await fetchWithRetry(results[0].url);
+      const pageHtml = await pageResponse.text();
+      const streamUrls = await extractStreamsFromPage(pageHtml, results[0].url);
+
+      const streams = streamUrls.map((url, index) => ({
+        url,
+        title: `${results[0].title} [${index + 1}]`,
+      }));
+
+      return new Response(JSON.stringify({ streams }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    } catch (error) {
+      console.error(`Stream error: ${error.message}`);
+      return new Response(JSON.stringify({ streams: [] }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
   }
 
   if (path === '/search-api') {
