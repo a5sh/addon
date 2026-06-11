@@ -1,5 +1,3 @@
 name = "addon"
-type = "javascript"
-account_id = "381e7575580a02003bd9a2d345c9e757"
-workers_dev = true
+compatibility_date = "2026-06-11"
 main = "index.js"
