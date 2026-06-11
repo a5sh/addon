@@ -1,10 +1,8 @@
-import * as cheerio from 'https://esm.sh/cheerio';
-
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.2.4',
+  version: '0.2.5',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams from MoviesMod with direct download links',
+  description: 'Extracts HTTP streams from MoviesMod with direct download links (Zero Dependency)',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -21,19 +19,15 @@ const MOVIESMOD_BASE = 'https://moviesmod.army';
 const cache = new Map();
 const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours
 
-// Custom error types
-class NotFoundError extends Error {
-  constructor(message = 'Not Found') {
-    super(message);
-    this.name = 'NotFoundError';
-  }
+// Helper to safely extract regex match
+function getMatch(text, regex, index = 1) {
+  const match = text.match(regex);
+  return match ? match[index] : null;
 }
 
-class BlockedError extends Error {
-  constructor(message = 'Blocked') {
-    super(message);
-    this.name = 'BlockedError';
-  }
+// Helper to strip HTML tags from string
+function stripTags(html) {
+  return (html || '').replace(/<[^>]*>/g, '').trim();
 }
 
 // Fetcher with retry logic and timeout
@@ -56,14 +50,14 @@ async function fetchWithRetry(url, options = {}, retries = 3) {
         clearTimeout(timeoutId);
         
         if (response.status === 403 || response.status === 429) {
-          throw new BlockedError(`HTTP ${response.status}`);
+          throw new Error(`Blocked: HTTP ${response.status}`);
         }
         if (response.status === 404) {
-          throw new NotFoundError(`HTTP 404`);
+          throw new Error(`NotFound: HTTP 404`);
         }
         return response;
       } catch (error) {
-        if (error instanceof NotFoundError || error instanceof BlockedError) {
+        if (error.message.includes('NotFound') || error.message.includes('Blocked')) {
           throw error;
         }
         if (attempt === retries - 1) throw error;
@@ -76,7 +70,7 @@ async function fetchWithRetry(url, options = {}, retries = 3) {
   }
 }
 
-// Search for content on MoviesMod using AST
+// Search for content using raw Regex
 async function searchMoviesMod(query) {
   const cacheKey = `search:${query}`;
   if (cache.has(cacheKey)) {
@@ -91,36 +85,32 @@ async function searchMoviesMod(query) {
     const searchUrl = `${MOVIESMOD_BASE}/?s=${encodeURIComponent(query)}`;
     const response = await fetchWithRetry(searchUrl);
     const html = await response.text();
-    const $ = cheerio.load(html);
 
     const results = [];
     
-    // Evaluate standard content container layouts for search
-    $('article.latestPost, article.post, .post').each((_, el) => {
-      const a = $(el).find('h2 a, .title a, a.title').first();
-      if (a.length === 0) return;
-      
-      const url = a.attr('href');
-      const title = a.attr('title') || a.text().trim();
+    // Extract individual articles
+    const articleRegex = /<article[^>]*>([\s\S]*?)<\/article>/gi;
+    let articleMatch;
 
-      if (url && title && !url.includes('javascript')) {
-        const fullUrl = url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`;
-        
-        if (!results.some(r => r.url === fullUrl)) {
-          results.push({
-            url: fullUrl,
-            title: title,
-            source: 'moviesmod',
-          });
+    while ((articleMatch = articleRegex.exec(html)) !== null) {
+      const articleHtml = articleMatch[1];
+      const linkMatch = articleHtml.match(/<a[^>]+href=["']([^"']+)["'][^>]*title=["']([^"']+)["']/i) 
+                     || articleHtml.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+
+      if (linkMatch) {
+        const url = linkMatch[1];
+        const title = stripTags(linkMatch[2]);
+
+        if (url && title && !url.includes('javascript')) {
+          const fullUrl = url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`;
+          if (!results.some(r => r.url === fullUrl)) {
+            results.push({ url: fullUrl, title, source: 'moviesmod' });
+          }
         }
       }
-    });
+    }
 
-    cache.set(cacheKey, {
-      data: results,
-      timestamp: Date.now(),
-    });
-
+    cache.set(cacheKey, { data: results, timestamp: Date.now() });
     return results;
   } catch (error) {
     console.error(`MoviesMod search error for "${query}":`, error.message);
@@ -128,61 +118,59 @@ async function searchMoviesMod(query) {
   }
 }
 
-// Extract download links from page
+// Extract download links using Chunk Splitting
 async function extractDownloadLinks(moviePageUrl, logs) {
   try {
     logs.push(`[Extract] Fetching movie page: ${moviePageUrl}`);
     const response = await fetchWithRetry(moviePageUrl);
     const html = await response.text();
 
-    const $ = cheerio.load(html);
     const links = [];
     
-    const contentBox = $('.thecontent');
-    if (contentBox.length === 0) {
+    const contentMatch = html.match(/class=["'][^"']*thecontent[^"']*["'][^>]*>([\s\S]*?)(?:<div class="post-navigation"|<h4 class="total-comments"|<\/article>|<div id="comments")/i);
+    if (!contentMatch) {
       logs.push('[Extract] ✗ No .thecontent div found');
       return links;
     }
 
-    let lastHeader = 'Unknown Quality';
+    const contentHtml = contentMatch[1];
     
-    // Iterate sequentially over elements to associate links with the closest preceding header
-    contentBox.children().each((_, el) => {
-      const tagName = el.tagName.toLowerCase();
+    // Split DOM sequentially by headers to bind links to their closest preceding header
+    const blocks = contentHtml.split(/(?=<h[2-6])/i);
+    
+    for (const block of blocks) {
+      const headerMatch = block.match(/<h[2-6][^>]*>([\s\S]*?)<\/h[2-6]>/i);
+      const rawHeader = stripTags(headerMatch ? headerMatch[1] : 'Unknown Quality');
       
-      if (['h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
-        lastHeader = $(el).text().trim();
-      } else if (tagName === 'p' || tagName === 'div') {
-        $(el).find('a').each((_, aEl) => {
-          const a = $(aEl);
-          const url = a.attr('href');
-          
-          if (url && (url.includes('modpro') || url.includes('links'))) {
-            logs.push(`[Extract] Evaluated anchor URL: ${url}`);
-            
-            // Apply regex extraction against the active state of lastHeader
-            const qualityMatch = lastHeader.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
-            const bitMatch = lastHeader.match(/\b(10Bit|8Bit)\b/i);
-            const sizeMatch = lastHeader.match(/\[([0-9.]+\s*[KMGT]B)\]/i);
-            
-            let quality = lastHeader;
-            if (quality.length > 100) {
-              quality = '';
-              if (qualityMatch) quality += qualityMatch[1];
-              if (bitMatch) quality += ' ' + bitMatch[1];
-              if (sizeMatch) quality += ' [' + sizeMatch[1] + ']';
-              if (!quality) quality = 'Unknown';
-            }
-
-            links.push({
-              quality: quality.trim(),
-              url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`,
-            });
-            logs.push(`[Extract] ✓ Captured link for quality: ${quality.trim()}`);
-          }
-        });
+      const qualityMatch = rawHeader.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
+      const bitMatch = rawHeader.match(/\b(10Bit|8Bit)\b/i);
+      const sizeMatch = rawHeader.match(/\[([0-9.]+\s*[KMGT]B)\]/i);
+      
+      let quality = rawHeader;
+      if (quality.length > 100 || !qualityMatch) {
+        quality = '';
+        if (qualityMatch) quality += qualityMatch[1];
+        if (bitMatch) quality += ' ' + bitMatch[1];
+        if (sizeMatch) quality += ' [' + sizeMatch[1] + ']';
+        if (!quality) quality = 'Unknown';
       }
-    });
+      quality = quality.trim();
+
+      const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+      let linkMatch;
+      
+      while ((linkMatch = linkRegex.exec(block)) !== null) {
+        const url = linkMatch[1];
+        if (url && (url.includes('modpro') || url.includes('links'))) {
+          logs.push(`[Extract] Evaluated anchor URL: ${url}`);
+          links.push({
+            quality: quality,
+            url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`,
+          });
+          logs.push(`[Extract] ✓ Captured link for quality: ${quality}`);
+        }
+      }
+    }
 
     logs.push(`[Extract] Found ${links.length} download links`);
     return links;
@@ -192,7 +180,7 @@ async function extractDownloadLinks(moviePageUrl, logs) {
   }
 }
 
-// Resolve SID (unblockedgames.world, creativeexpressions) token payloads
+// Resolve SID token payloads (Regex string extraction)
 async function resolveTechUnblockedLink(sidUrl, logs) {
   logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
@@ -200,10 +188,9 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
   try {
     let response = await fetchWithRetry(sidUrl);
     let html = await response.text();
-    let $ = cheerio.load(html);
     
-    const wp_http = $('input[name="_wp_http"]').val();
-    let action1 = $('form').attr('action');
+    let wp_http = getMatch(html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
+    let action1 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
     
     if (!wp_http || !action1) {
       logs.push(`[SID] ✗ Could not find initial token _wp_http or form action.`);
@@ -215,19 +202,15 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     const formData1 = new URLSearchParams({ '_wp_http': wp_http });
     response = await fetchWithRetry(action1, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': sidUrl,
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': sidUrl },
       body: formData1.toString(),
     });
 
     html = await response.text();
-    $ = cheerio.load(html);
     
-    const wp_http2 = $('input[name="_wp_http2"]').val();
-    const token = $('input[name="token"]').val();
-    let action2 = $('form').attr('action');
+    let wp_http2 = getMatch(html, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
+    let token = getMatch(html, /name=["']token["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']token["']/i);
+    let action2 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
 
     if (!wp_http2 || !token || !action2) {
       logs.push(`[SID] ✗ Could not find secondary tokens _wp_http2 or token.`);
@@ -239,28 +222,25 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     const formData2 = new URLSearchParams({ '_wp_http2': wp_http2, token });
     response = await fetchWithRetry(action2, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': action1,
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': action1 },
       body: formData2.toString(),
     });
 
     html = await response.text();
-    let match = html.match(/setAttribute\("href",\s*"([^"]+)"\)/);
     
-    if (!match) {
-      logs.push(`[SID] ✗ JS execution payload missing setAttribute("href"). Checking fallback...`);
-      const redirectMatch = html.match(/window\.location\.replace\("([^"]+)"\)/);
-      if(redirectMatch) {
-          const finalUrl = new URL(redirectMatch[1], origin).href;
-          logs.push(`[SID] ✓ Resolved via window.location fallback: ${finalUrl}`);
+    let matchUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+)"\)/);
+    if (!matchUrl) {
+      logs.push(`[SID] ✗ JS payload missing setAttribute. Checking window.location fallback...`);
+      const fallbackUrl = getMatch(html, /window\.location\.replace\("([^"]+)"\)/);
+      if(fallbackUrl) {
+          const finalUrl = new URL(fallbackUrl, origin).href;
+          logs.push(`[SID] ✓ Resolved via window.location: ${finalUrl}`);
           return finalUrl;
       }
       return null;
     }
     
-    const finalUrl = new URL(match[1], origin).href;
+    const finalUrl = new URL(matchUrl, origin).href;
     logs.push(`[SID] ✓ Successfully resolved SID: ${finalUrl}`);
     return finalUrl;
   } catch (error) {
@@ -269,41 +249,38 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
   }
 }
 
-// Resolve intermediate routing domains (dramadrip, modrefer, modpro)
+// Resolve intermediate routing domains via Regex
 async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
   try {
     const urlObject = new URL(initialUrl);
+    const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
 
     if (urlObject.hostname.includes('dramadrip.com')) {
       logs.push(`[Dramadrip] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
-      const $ = cheerio.load(html);
 
       let episodePageLink = null;
       const seasonMatch = quality.match(/Season\s+(\d+)/i);
+      const targetQuality = getMatch(quality, /(1080p|720p|480p|2160p)/i, 1)?.toLowerCase() || '';
       
-      if (seasonMatch) {
-        const seasonId = seasonMatch[0].toLowerCase();
-        const qualityMatch = quality.match(/(1080p|720p|480p|2160p)/i);
-        const targetQuality = qualityMatch ? qualityMatch[1].toLowerCase() : '';
-
-        $('a').each((_, el) => {
-          const a = $(el);
-          const link = a.attr('href') || '';
-          const text = a.text().toLowerCase();
-          const headerMatch = html.match(new RegExp(seasonId + '[^<]*', 'i'));
+      let match;
+      while ((match = linkRegex.exec(html)) !== null) {
+        const link = match[1];
+        const text = stripTags(match[2]).toLowerCase();
+        
+        if (link.includes('episodes.modpro') || link.includes('cinematickit')) {
+          if (!episodePageLink) episodePageLink = link; // Fallback
           
-          if (link.includes('episodes.modpro') || link.includes('cinematickit')) {
-            if (targetQuality && text.includes(targetQuality) && headerMatch) {
+          if (seasonMatch && targetQuality) {
+            const seasonId = seasonMatch[0].toLowerCase();
+            const headerRegex = new RegExp(seasonId + '[^<]*', 'i');
+            if (text.includes(targetQuality) && html.match(headerRegex)) {
               episodePageLink = link;
+              break;
             }
           }
-        });
-      }
-
-      if (!episodePageLink) {
-        episodePageLink = $('a[href*="episodes.modpro"], a[href*="cinematickit"]').first().attr('href') || null;
+        }
       }
 
       if (episodePageLink) {
@@ -314,16 +291,15 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
       logs.push(`[Episodes] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
-      const $ = cheerio.load(html);
 
       const finalLinks = [];
-      $('a[href*="driveseed"]').each((_, el) => {
-        const a = $(el);
-        finalLinks.push({
-          server: a.text().trim() || 'Driveseed',
-          url: a.attr('href'),
-        });
-      });
+      let match;
+      while ((match = linkRegex.exec(html)) !== null) {
+        const link = match[1];
+        if (link.includes('driveseed')) {
+          finalLinks.push({ server: stripTags(match[2]) || 'Driveseed', url: link });
+        }
+      }
       logs.push(`[Episodes] Found ${finalLinks.length} links`);
       return finalLinks;
 
@@ -331,25 +307,20 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
       logs.push(`[ModRefer] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
-      const $ = cheerio.load(html);
 
       const finalLinks = [];
-      
-      $('a').each((_, el) => {
-        const a = $(el);
-        const url = a.attr('href');
-        const text = a.text().trim();
+      let match;
+      while ((match = linkRegex.exec(html)) !== null) {
+        const url = match[1];
+        const text = stripTags(match[2]);
         
         if (url && (url.includes('driveseed') || url.includes('drive') || url.includes('cloud') || url.includes('unblockedgames') || url.includes('urlflix'))) {
           if (!text.toLowerCase().includes('comment')) {
-            finalLinks.push({ 
-              server: text || 'Direct Link', 
-              url 
-            });
+            finalLinks.push({ server: text || 'Direct Link', url });
             logs.push(`[ModRefer] Extracted target server: ${text}`);
           }
         }
-      });
+      }
       
       logs.push(`[ModRefer] Found ${finalLinks.length} valid routing links`);
       return finalLinks;
@@ -362,7 +333,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
   }
 }
 
-// Resolve driveseed domains against JS challenge limits
+// Resolve driveseed domains using regex extraction
 async function resolveDriveseedLink(driveseedUrl, logs) {
   try {
     logs.push(`[Driveseed] Resolving: ${driveseedUrl}`);
@@ -379,34 +350,28 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
     logs.push(`[Driveseed] Following JS redirect to ${finalUrl}`);
     const finalResponse = await fetchWithRetry(finalUrl);
     const finalHtml = await finalResponse.text();
-    const $ = cheerio.load(finalHtml);
 
     const downloadOptions = [];
-    
-    $('a').each((_, el) => {
-      const a = $(el);
-      const href = a.attr('href') || '';
-      const text = a.text().toLowerCase();
-      
+    const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+
+    while ((match = linkRegex.exec(finalHtml)) !== null) {
+      const href = match[1];
+      const text = stripTags(match[2]).toLowerCase();
+
       if (href.includes('instant') || href.includes('video-seed')) {
         if (text.includes('instant')) {
-           downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
+          downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
         }
       } else if (href.includes('resume')) {
         downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
       } else if (href.includes('worker')) {
         downloadOptions.push({ title: 'Resume Worker Bot', type: 'worker', url: href, priority: 3 });
       }
-    });
+    }
 
-    let size = null;
-    let fileName = null;
-    
-    const sizeMatch = finalHtml.match(/Size\s*:\s*([0-9.,]+\s*[KMGT]B)/i);
-    if (sizeMatch) size = sizeMatch[1];
-
-    const fileMatch = finalHtml.match(/Name\s*:\s*([^<]+)/i);
-    if (fileMatch) fileName = fileMatch[1].trim();
+    const size = getMatch(finalHtml, /Size\s*:\s*([0-9.,]+\s*[KMGT]B)/i);
+    const fileName = getMatch(finalHtml, /Name\s*:\s*([^<]+)/i, 1)?.trim() || null;
 
     downloadOptions.sort((a, b) => a.priority - b.priority);
     logs.push(`[Driveseed] ✓ Found ${downloadOptions.length} download options`);
@@ -444,9 +409,7 @@ async function extractAllDownloadableLinks(moviePageUrl) {
             if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
               logs.push(`[Main] SID link detected, escalating to resolveTechUnblockedLink`);
               const resolvedSid = await resolveTechUnblockedLink(currentUrl, logs);
-              if (resolvedSid) {
-                currentUrl = resolvedSid;
-              }
+              if (resolvedSid) currentUrl = resolvedSid;
             }
 
             if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
@@ -490,9 +453,7 @@ async function extractAllDownloadableLinks(moviePageUrl) {
 // Stremio HTTP server handler defining frontend layout
 async function handleRequest(request) {
   const url = new URL(request.url);
-  let path = url.pathname;
-  
-  if (!path || path === '') path = '/';
+  let path = url.pathname || '/';
 
   if (path === '/' || path === '/search') {
     return new Response(`<!DOCTYPE html>
@@ -503,27 +464,13 @@ async function handleRequest(request) {
   <title>MoviesMod Enhanced Scraper</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
-    }
-    .container {
-      background: white;
-      border-radius: 12px;
-      padding: 40px;
-      max-width: 1200px;
-      margin: 0 auto;
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+    .container { background: white; border-radius: 12px; padding: 40px; max-width: 1200px; margin: 0 auto; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3); }
     h1 { color: #333; margin-bottom: 10px; text-align: center; }
     .subtitle { color: #666; text-align: center; margin-bottom: 30px; font-size: 14px; }
     .search-box { display: flex; gap: 10px; margin-bottom: 30px; }
     input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; }
-    input:focus { outline: none; border-color: #667eea; }
     button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; }
-    button:hover { background: #764ba2; }
     .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 30px; }
     @media (max-width: 768px) { .two-column { grid-template-columns: 1fr; } }
     .section { background: #f9f9f9; padding: 20px; border-radius: 8px; border: 1px solid #e0e0e0; }
@@ -532,7 +479,6 @@ async function handleRequest(request) {
     .result-title { font-weight: 600; color: #333; margin-bottom: 6px; font-size: 13px; }
     .result-url { font-size: 11px; color: #666; font-family: monospace; background: #f0f0f0; padding: 6px; border-radius: 4px; margin-bottom: 6px; display: block; overflow-x: auto; }
     .copy-btn { font-size: 10px; padding: 4px 12px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer; }
-    .copy-btn:hover { background: #d0d0d0; }
     .loading { text-align: center; color: #666; padding: 20px; }
     .error { background: #fee; color: #c33; padding: 15px; border-radius: 8px; border-left: 4px solid #c33; margin-top: 20px; }
     .empty { text-align: center; color: #999; padding: 30px 20px; font-size: 14px; }
@@ -541,16 +487,10 @@ async function handleRequest(request) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links</p>
+    <p class="subtitle">Search & Extract Direct Download Links (Zero Dep)</p>
     
     <div class="search-box">
-      <input 
-        type="text" 
-        id="searchInput" 
-        placeholder="Search movie or series..." 
-        onkeypress="if(event.key==='Enter') search()"
-        autofocus
-      >
+      <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
       <button onclick="search()">Search</button>
     </div>
 
@@ -581,26 +521,21 @@ async function handleRequest(request) {
       const query = document.getElementById('searchInput').value.trim();
       if (!query) return;
 
-      const pageDiv = document.getElementById('pageResults');
-      const downloadDiv = document.getElementById('downloadResults');
-      const debugDiv = document.getElementById('debugLogs');
-      const alertDiv = document.getElementById('alert');
-      
-      alertDiv.style.display = 'none';
-      pageDiv.innerHTML = '<div class="loading">Searching movies...</div>';
-      downloadDiv.innerHTML = '';
-      debugDiv.innerHTML = '<div class="loading">Awaiting trace logs...</div>';
+      document.getElementById('alert').style.display = 'none';
+      document.getElementById('pageResults').innerHTML = '<div class="loading">Searching movies...</div>';
+      document.getElementById('downloadResults').innerHTML = '';
+      document.getElementById('debugLogs').innerHTML = '<div class="loading">Awaiting trace logs...</div>';
 
       try {
         const pageResponse = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
         const pageData = await pageResponse.json();
 
         if (!pageData.results || pageData.results.length === 0) {
-          pageDiv.innerHTML = '<div class="empty">No results found</div>';
+          document.getElementById('pageResults').innerHTML = '<div class="empty">No results found</div>';
           return;
         }
 
-        pageDiv.innerHTML = pageData.results.map((r, i) => \`
+        document.getElementById('pageResults').innerHTML = pageData.results.map((r, i) => \`
           <div class="result-item">
             <div class="result-title">\${i + 1}. \${r.title}</div>
             <span class="result-url">\${r.url}</span>
@@ -608,14 +543,14 @@ async function handleRequest(request) {
           </div>
         \`).join('');
 
-        downloadDiv.innerHTML = '<div class="loading">Extracting download links...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting download links...</div>';
         
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
         const linksData = await linksResponse.json();
 
         if (linksData.logs) {
-          debugDiv.innerHTML = linksData.logs.map(log => {
+          document.getElementById('debugLogs').innerHTML = linksData.logs.map(log => {
              const isErr = log.includes('✗');
              const isPass = log.includes('✓');
              const color = isErr ? '#c33' : isPass ? '#2a9d8f' : '#444';
@@ -624,7 +559,7 @@ async function handleRequest(request) {
         }
 
         if (!linksData.links || linksData.links.length === 0) {
-          downloadDiv.innerHTML = '<div class="empty">No downloadable links found</div>';
+          document.getElementById('downloadResults').innerHTML = '<div class="empty">No downloadable links found</div>';
           return;
         }
 
@@ -636,9 +571,7 @@ async function handleRequest(request) {
 
         let html = '';
         Object.keys(grouped).forEach(quality => {
-          html += \`<div style="margin-bottom: 15px;">
-            <div class="result-title">\${quality}</div>\`;
-          
+          html += \`<div style="margin-bottom: 15px;"><div class="result-title">\${quality}</div>\`;
           grouped[quality].forEach(link => {
             html += \`<div style="margin-left: 10px; margin-bottom: 8px;">
               <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
@@ -648,15 +581,13 @@ async function handleRequest(request) {
               <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
             </div>\`;
           });
-          
           html += '</div>';
         });
 
-        downloadDiv.innerHTML = html;
-
+        document.getElementById('downloadResults').innerHTML = html;
       } catch (error) {
-        alertDiv.textContent = \`Error: \${error.message}\`;
-        alertDiv.style.display = 'block';
+        document.getElementById('alert').textContent = \`Error: \${error.message}\`;
+        document.getElementById('alert').style.display = 'block';
       }
     }
 
@@ -666,9 +597,7 @@ async function handleRequest(request) {
     }
   </script>
 </body>
-</html>`, {
-      headers: { 'Content-Type': 'text/html' },
-    });
+</html>`, { headers: { 'Content-Type': 'text/html' } });
   }
 
   if (path === '/manifest.json') {
@@ -679,62 +608,25 @@ async function handleRequest(request) {
 
   if (path === '/search-api') {
     const query = url.searchParams.get('q');
-    if (!query) {
-      return new Response(JSON.stringify({ results: [] }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
-    }
+    if (!query) return new Response(JSON.stringify({ results: [] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
 
     try {
       const results = await searchMoviesMod(query);
-      return new Response(JSON.stringify({ results: results.slice(0, 10) }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
+      return new Response(JSON.stringify({ results: results.slice(0, 10) }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     } catch (error) {
-      return new Response(JSON.stringify({ results: [], error: error.message }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
+      return new Response(JSON.stringify({ results: [], error: error.message }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
   }
 
   if (path === '/extract-links') {
     const pageUrl = url.searchParams.get('url');
-    if (!pageUrl) {
-      return new Response(JSON.stringify({ links: [], logs: ['✗ No URL provided'] }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
-    }
+    if (!pageUrl) return new Response(JSON.stringify({ links: [], logs: ['✗ No URL provided'] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
 
     try {
       const result = await extractAllDownloadableLinks(pageUrl);
-      return new Response(JSON.stringify({ links: result.links, logs: result.logs }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
+      return new Response(JSON.stringify({ links: result.links, logs: result.logs }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     } catch (error) {
-      return new Response(JSON.stringify({ links: [], logs: [`✗ Fatal error: ${error.message}`] }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
-    }
-  }
-
-  const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
-  if (streamMatch) {
-    const type = streamMatch[1];
-    const id = streamMatch[2];
-
-    try {
-      if (!id.startsWith('tt') && !id.startsWith('tmdb:')) {
-        return new Response(JSON.stringify({ streams: [] }), {
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-        });
-      }
-      return new Response(JSON.stringify({ streams: [] }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
-    } catch (error) {
-      return new Response(JSON.stringify({ streams: [] }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
+      return new Response(JSON.stringify({ links: [], logs: [`✗ Fatal error: ${error.message}`] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
   }
 
@@ -744,23 +636,14 @@ async function handleRequest(request) {
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
+      return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } });
     }
 
     try {
       return await handleRequest(request);
     } catch (error) {
       console.error('Worker error:', error);
-      return new Response(JSON.stringify({ error: 'Internal server error' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   },
 };
