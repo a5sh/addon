@@ -1,8 +1,8 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.2.9',
+  version: '0.3.0',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams from MoviesMod with direct download links (Sequential & Stateful)',
+  description: 'Extracts HTTP streams from MoviesMod with direct download links (Concurrent & Stateful)',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -40,6 +40,8 @@ async function fetchWithRetry(url, options = {}, retries = 2) {
         signal: controller.signal,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
           ...options.headers,
         },
       });
@@ -48,15 +50,11 @@ async function fetchWithRetry(url, options = {}, retries = 2) {
       if (response.status === 403 || response.status === 429) {
         throw new Error(`Blocked: HTTP ${response.status}`);
       }
-      if (response.status === 404) {
-        throw new Error(`NotFound: HTTP 404`);
-      }
+      // Don't throw on 404 immediately, sometimes bypass scripts return 404 for valid states
       return response;
     } catch (error) {
       clearTimeout(timeoutId);
-      if (error.message.includes('NotFound') || error.message.includes('Blocked')) {
-        throw error;
-      }
+      if (error.message.includes('Blocked')) throw error;
       if (attempt === retries - 1) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
     }
@@ -168,28 +166,41 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
   const { origin } = new URL(sidUrl);
   const cookieMap = new Map();
 
-  function parseCookies(res) {
-    const sc = res.headers.get('set-cookie');
-    if (sc) {
-      const matches = sc.match(/([a-zA-Z0-9_-]+)=([^;,\s]+)/g);
-      if (matches) {
-        matches.forEach(m => {
-          const [k, v] = m.split('=');
-          if (!['path', 'expires', 'domain', 'samesite', 'secure', 'httponly', 'max-age'].includes(k.toLowerCase())) {
-            cookieMap.set(k, v);
-          }
-        });
+  // Safely parses both HTTP Headers and inline JS for session cookies
+  function extractCookies(res, htmlBody) {
+    try {
+      let headerCookies = [];
+      if (typeof res.headers.getSetCookie === 'function') {
+        headerCookies = res.headers.getSetCookie();
+      } else {
+        const sc = res.headers.get('set-cookie');
+        if (sc) headerCookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
       }
+
+      headerCookies.forEach(c => {
+        const pair = c.split(';')[0].trim();
+        const [k, ...v] = pair.split('=');
+        if (k && !['path', 'expires', 'domain'].includes(k.toLowerCase())) {
+          cookieMap.set(k.trim(), v.join('='));
+        }
+      });
+
+      if (htmlBody) {
+        const jsRegex = /document\.cookie\s*=\s*["']([^"']+)["']/gi;
+        let match;
+        while ((match = jsRegex.exec(htmlBody)) !== null) {
+          const pair = match[1].split(';')[0].trim();
+          const [k, ...v] = pair.split('=');
+          if (k) cookieMap.set(k.trim(), v.join('='));
+        }
+      }
+    } catch (e) {
+       logs.push(`[SID] Warning: Cookie parsing error: ${e.message}`);
     }
   }
 
   function getHeaders(referer) {
-    const headers = { 
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-      'Upgrade-Insecure-Requests': '1'
-    };
+    const headers = { 'Upgrade-Insecure-Requests': '1' };
     if (referer) headers['Referer'] = referer;
     if (cookieMap.size > 0) {
       headers['Cookie'] = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
@@ -199,9 +210,9 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
 
   try {
     // Step 1: Initialize session token
-    let response = await fetchWithRetry(sidUrl, { headers: getHeaders() });
-    parseCookies(response);
+    let response = await fetchWithRetry(sidUrl, { headers: getHeaders(), redirect: 'manual' });
     let html = await response.text();
+    extractCookies(response, html);
     
     let wp_http = getMatch(html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
     let action1 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
@@ -218,9 +229,10 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
       method: 'POST',
       headers: { ...getHeaders(sidUrl), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formData1.toString(),
+      redirect: 'manual'
     });
-    parseCookies(response);
     html = await response.text();
+    extractCookies(response, html);
     
     let wp_http2 = getMatch(html, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
     let token = getMatch(html, /name=["']token["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']token["']/i);
@@ -238,26 +250,28 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
       method: 'POST',
       headers: { ...getHeaders(action1Url), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formData2.toString(),
+      redirect: 'manual'
     });
-    parseCookies(response);
     html = await response.text();
+    extractCookies(response, html);
     
     let matchUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+)"\)/);
     if (!matchUrl) {
       const fallbackUrl = getMatch(html, /window\.location\.replace\("([^"]+)"\)/);
-      if(!fallbackUrl) return null;
+      if(!fallbackUrl) {
+         logs.push(`[SID] ✗ No jump link generated in payload.`);
+         return null;
+      }
       matchUrl = fallbackUrl;
     }
     
     const intermediateUrl = new URL(matchUrl, origin).href;
-    logs.push(`[SID] Intermediary ?go URL extracted: ${intermediateUrl}`);
+    logs.push(`[SID] Intermediary URL extracted. Waiting 8s to clear server timer...`);
 
-    // EXPLOIT: Force 6000ms delay to clear the backend "Double Click" velocity anti-bot trap
-    logs.push(`[SID] Waiting 6s to bypass server-side velocity timer...`);
-    await new Promise(r => setTimeout(r, 6000));
+    // EXPLOIT: Force 8000ms delay to clear the backend "Double Click" velocity anti-bot trap
+    await new Promise(r => setTimeout(r, 8000));
 
     // Step 4: Follow jump link with strict cookie preservation
-    // Setting redirect to 'manual' prevents native fetch from dropping custom headers on 302 jumps
     const redirectRes = await fetch(intermediateUrl, {
       method: 'GET',
       headers: getHeaders(action2Url),
@@ -265,7 +279,9 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     });
     
     let finalUrl = null;
-    if (redirectRes.status === 301 || redirectRes.status === 302 || redirectRes.status === 307 || redirectRes.status === 308) {
+    
+    // Manual handling of 302/301 redirects to preserve the final driveseed location
+    if ([301, 302, 307, 308].includes(redirectRes.status)) {
       finalUrl = redirectRes.headers.get('Location');
     } else {
       const redirectHtml = await redirectRes.text();
@@ -425,22 +441,14 @@ async function extractAllDownloadableLinks(moviePageUrl) {
     }
 
     const allDownloadableLinks = [];
-    const startTime = Date.now();
 
-    // Enforce sequential processing to respect execution timing structures
-    for (const link of downloadLinks) {
-      // Cloudflare free tier restricts wall clock time to 30s. 
-      // Safely end execution block early if the 25-second limit is breached.
-      if (Date.now() - startTime > 25000) {
-         logs.push(`[Main] ⚠️ Cloudflare execution limit approaching. Ending extractions early.`);
-         break;
-      }
-
+    // Concurrent execution to ensure 8 second delays execute simultaneously without triggering 30s CF timeout
+    const extractionPromises = downloadLinks.slice(0, 6).map(async (link) => {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
         
-        // Target optimization: Restrict network processing to the primary target to preserve subrequests limit
+        // Process ONLY the primary Fast Server to preserve Cloudflare's 50 fetch subrequest limit
         const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
         const targetsToProcess = primaryTarget ? [primaryTarget] : [];
 
@@ -490,7 +498,10 @@ async function extractAllDownloadableLinks(moviePageUrl) {
       } catch (e) {
         logs.push(`[Main] ✗ Quality Parse Error (${link.quality}): ${e.message}`);
       }
-    }
+    });
+
+    // Wait for all qualities to finish resolving concurrently
+    await Promise.all(extractionPromises);
 
     logs.push(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
     return { links: allDownloadableLinks, logs };
@@ -536,7 +547,7 @@ async function handleRequest(request) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (Sequential, Stateful, Safe)</p>
+    <p class="subtitle">Search & Extract Direct Download Links (Concurrent & Stateful)</p>
     
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
@@ -592,7 +603,7 @@ async function handleRequest(request) {
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting links sequentially (Time limits apply)...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Bypassing Tokens & Timers (approx ~12 seconds)...</div>';
         
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
