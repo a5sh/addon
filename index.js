@@ -1,8 +1,8 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.3.4',
+  version: '0.3.3',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams from MoviesMod (With JS Fallback Support)',
+  description: 'Extracts HTTP streams from MoviesMod (Stateful Cookies & Redirect Follow)',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -57,69 +57,6 @@ async function fetchWithRetry(url, options = {}, retries = 2) {
       if (attempt === retries - 1) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
     }
-  }
-}
-
-// Updated June 2026 Resolver using Browserless rendering fallback to process click-based countdown flow
-async function resolveTechUnblockedLinkSimple(sidUrl, logs, env) {
-  logs.push(`[TechUnblocked] Resolving SID: ${sidUrl.substring(0, 80)}...`);
-
-  // Step 1: Try regex extraction first
-  try {
-    const response = await fetchWithRetry(sidUrl);
-    const html = await response.text();
-    const goLinkMatch = html.match(/id="two_steps_btn"[^>]*href=["']([^"']+)["']/i);
-    
-    if (goLinkMatch) {
-      logs.push(`[TechUnblocked] ✓ Direct extraction: ${goLinkMatch[1].substring(0, 80)}...`);
-      return goLinkMatch[1];
-    }
-  } catch (error) {
-    logs.push(`[TechUnblocked] Regex extraction failed: ${error.message}`);
-  }
-
-  // Step 2: Use Browserless with simple rendering (no pageFunction)
-  if (!env?.BROWSERLESS_KEY) {
-    logs.push(`[TechUnblocked] ✗ No BROWSERLESS_KEY - cannot resolve JS redirects`);
-    logs.push(`[TechUnblocked] → Add BROWSERLESS_KEY to wrangler.toml to enable`);
-    return null;
-  }
-
-  try {
-    logs.push(`[TechUnblocked] Using Browserless for full JS rendering...`);
-    
-    const response = await fetch('https://chrome.browserless.io/content?token=' + env.BROWSERLESS_KEY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: sidUrl,
-        waitFor: 5000, // Wait for JS/timers to execute
-      }),
-    });
-
-    const html = await response.text();
-    
-    // Extract from fully-rendered HTML
-    const goLinkMatch = html.match(/id="two_steps_btn"[^>]*href=["']([^"']+\?go=[^"']+)["']/i);
-    if (goLinkMatch) {
-      logs.push(`[TechUnblocked] ✓ Browserless extracted: ${goLinkMatch[1].substring(0, 80)}...`);
-      return goLinkMatch[1];
-    }
-
-    // Try alternate pattern
-    const altMatch = html.match(/\?go=([a-zA-Z0-9_-]+)/);
-    if (altMatch) {
-      const goUrl = `${new URL(sidUrl).origin}/?go=${altMatch[1]}`;
-      logs.push(`[TechUnblocked] ✓ Found via pattern: ${goUrl}`);
-      return goUrl;
-    }
-
-    logs.push(`[TechUnblocked] ✗ Could not extract ?go= URL even after Browserless rendering`);
-    return null;
-
-  } catch (error) {
-    logs.push(`[TechUnblocked] ✗ Browserless failed: ${error.message}`);
-    return null;
   }
 }
 
@@ -222,7 +159,172 @@ async function extractDownloadLinks(moviePageUrl, logs) {
   }
 }
 
-async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs, env) {
+// Resolves payload via virtual cookie injection and automated redirect tracking
+async function resolveTechUnblockedLink(sidUrl, logs) {
+  logs.push(`[SID] Resolving payload for: ${sidUrl}`);
+  const { origin } = new URL(sidUrl);
+  
+  const cookieMap = new Map();
+  // Pre-seed the cookie map to spoof a valid PHP session
+  cookieMap.set('PHPSESSID', Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
+  cookieMap.set('cf_clearance', Math.random().toString(36).substring(2, 15));
+
+  function extractCookies(res, htmlBody) {
+    try {
+      let headerCookies = [];
+      if (typeof res.headers.getSetCookie === 'function') {
+        headerCookies = res.headers.getSetCookie();
+      } else {
+        const sc = res.headers.get('set-cookie');
+        if (sc) headerCookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
+      }
+
+      if (Array.isArray(headerCookies)) {
+        headerCookies.forEach(c => {
+          const pair = c.split(';')[0].trim();
+          const splitIndex = pair.indexOf('=');
+          if (splitIndex !== -1) {
+            const k = pair.slice(0, splitIndex).trim();
+            const v = pair.slice(splitIndex + 1).trim();
+            if (k && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly'].includes(k.toLowerCase())) {
+              cookieMap.set(k, v);
+            }
+          }
+        });
+      }
+
+      if (htmlBody) {
+        const jsRegex = /document\.cookie\s*=\s*(['"`])([^`'"]+)\1/gi;
+        let match;
+        while ((match = jsRegex.exec(htmlBody)) !== null) {
+          const pair = match[2].split(';')[0].trim();
+          const splitIndex = pair.indexOf('=');
+          if (splitIndex !== -1) {
+            const k = pair.slice(0, splitIndex).trim();
+            const v = pair.slice(splitIndex + 1).trim();
+            if (k) cookieMap.set(k, v);
+          }
+        }
+      }
+    } catch (e) {
+       logs.push(`[SID] Warning: Cookie parsing error: ${e.message}`);
+    }
+  }
+
+  function getHeaders(referer) {
+    const headers = { 
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': referer ? 'same-origin' : 'cross-site',
+      'Upgrade-Insecure-Requests': '1'
+    };
+    if (referer) headers['Referer'] = referer;
+    if (cookieMap.size > 0) {
+      headers['Cookie'] = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+    }
+    return headers;
+  }
+
+  try {
+    let response = await fetchWithRetry(sidUrl, { headers: getHeaders(), redirect: 'manual' });
+    let html = await response.text();
+    extractCookies(response, html);
+    
+    let wp_http = getMatch(html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
+    let action1 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
+    
+    if (!wp_http || !action1) {
+      logs.push(`[SID] ✗ Could not find initial token _wp_http or form action.`);
+      return null;
+    }
+    const action1Url = new URL(action1, origin).href;
+
+    const formData1 = new URLSearchParams({ '_wp_http': wp_http });
+    response = await fetchWithRetry(action1Url, {
+      method: 'POST',
+      headers: { ...getHeaders(sidUrl), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formData1.toString(),
+      redirect: 'manual'
+    });
+    html = await response.text();
+    extractCookies(response, html);
+    
+    let wp_http2 = getMatch(html, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
+    let token = getMatch(html, /name=["']token["']\s+value=["']([^"']+)["']/i) || getMatch(html, /value=["']([^"']+)["']\s+name=["']token["']/i);
+    let action2 = getMatch(html, /<form[^>]+action=["']([^"']+)["']/i);
+
+    if (!wp_http2 || !token || !action2) {
+      logs.push(`[SID] ✗ Could not find secondary tokens _wp_http2 or token.`);
+      return null;
+    }
+    const action2Url = new URL(action2, origin).href;
+
+    const formData2 = new URLSearchParams({ '_wp_http2': wp_http2, token });
+    response = await fetchWithRetry(action2Url, {
+      method: 'POST',
+      headers: { ...getHeaders(action1Url), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formData2.toString(),
+      redirect: 'manual'
+    });
+    html = await response.text();
+    extractCookies(response, html);
+    
+    let matchUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+)"\)/);
+    if (!matchUrl) {
+      const fallbackUrl = getMatch(html, /window\.location\.replace\("([^"]+)"\)/);
+      if(!fallbackUrl) {
+         logs.push(`[SID] ✗ No jump link generated in payload.`);
+         return null;
+      }
+      matchUrl = fallbackUrl;
+    }
+    
+    const intermediateUrl = new URL(matchUrl, origin).href;
+    logs.push(`[SID] Intermediary URL extracted. Waiting 8s to clear velocity timer...`);
+
+    await new Promise(r => setTimeout(r, 8000));
+
+    // Allow fetch to transparently follow the 302 location to DriveSeed
+    const redirectRes = await fetch(intermediateUrl, {
+      method: 'GET',
+      headers: getHeaders(action2Url),
+      redirect: 'follow' 
+    });
+    
+    let finalUrl = redirectRes.url;
+
+    // Fallback if it landed on an intermediate page without an HTTP status redirect
+    if (finalUrl === intermediateUrl || finalUrl.includes('?go=')) {
+      const redirectHtml = await redirectRes.text();
+      if (redirectHtml.includes("Bad Request")) {
+        logs.push(`[SID] ✗ Target returned Bad Request despite wait limit. Cookie map size: ${cookieMap.size}`);
+        return null;
+      }
+      const jsRedirectMatch = getMatch(redirectHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
+      const metaRedirectMatch = getMatch(redirectHtml, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[^"']*url=([^"']+)["']?/i);
+      
+      if (jsRedirectMatch) {
+         finalUrl = new URL(jsRedirectMatch, intermediateUrl).href;
+      } else if (metaRedirectMatch) {
+         finalUrl = new URL(metaRedirectMatch, intermediateUrl).href;
+      } else {
+         logs.push(`[SID] ✗ Target failed to provide JS redirect.`);
+         return null;
+      }
+    }
+
+    logs.push(`[SID] ✓ Successfully resolved SID path to: ${finalUrl}`);
+    return finalUrl;
+  } catch (error) {
+    logs.push(`[SID] ✗ Exception: ${error.message}`);
+    return null;
+  }
+}
+
+async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
   try {
     const urlObject = new URL(initialUrl);
     const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -254,7 +356,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs, en
       }
 
       if (episodePageLink) {
-        return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logs, env);
+        return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logs);
       }
     } else if (urlObject.hostname.includes('episodes.modpro.blog') || urlObject.hostname.includes('cinematickit.org')) {
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
@@ -304,12 +406,15 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
     const response = await fetchWithRetry(driveseedUrl);
     let finalHtml = await response.text();
 
+    // Check if Driveseed wrapped the page in a JS redirect, otherwise parse the raw page body
     const redirectMatch = getMatch(finalHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
     if (redirectMatch) {
       const finalUrl = redirectMatch.startsWith('http') ? redirectMatch : `https://driveseed.org${redirectMatch.startsWith('/') ? '' : '/'}${redirectMatch}`;
       logs.push(`[Driveseed] Following inner JS redirect to ${finalUrl}`);
       const finalResponse = await fetchWithRetry(finalUrl);
       finalHtml = await finalResponse.text();
+    } else {
+      logs.push(`[Driveseed] No inner redirect found, parsing root Driveseed body.`);
     }
 
     const downloadOptions = [];
@@ -343,7 +448,7 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
   }
 }
 
-async function extractAllDownloadableLinks(moviePageUrl, env) {
+async function extractAllDownloadableLinks(moviePageUrl) {
   const logs = [];
   logs.push(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
   try {
@@ -356,10 +461,11 @@ async function extractAllDownloadableLinks(moviePageUrl, env) {
 
     const allDownloadableLinks = [];
 
+    // STRICT: Limit to 1 Quality, 1 Target to bypass execution timeouts entirely during tests
     for (const link of downloadLinks.slice(0, 1)) {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
-        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs, env);
+        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
         
         const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
         const targetsToProcess = primaryTarget ? [primaryTarget] : [];
@@ -369,8 +475,7 @@ async function extractAllDownloadableLinks(moviePageUrl, env) {
             let currentUrl = targetLink.url;
 
             if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
-              // Integrated patch deployment execution
-              const resolvedSid = await resolveTechUnblockedLinkSimple(currentUrl, logs, env);
+              const resolvedSid = await resolveTechUnblockedLink(currentUrl, logs);
               if (resolvedSid) currentUrl = resolvedSid;
             }
 
@@ -421,7 +526,7 @@ async function extractAllDownloadableLinks(moviePageUrl, env) {
   }
 }
 
-async function handleRequest(request, env) {
+async function handleRequest(request) {
   const url = new URL(request.url);
   let path = url.pathname || '/';
 
@@ -457,7 +562,7 @@ async function handleRequest(request, env) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (v0.3.4)</p>
+    <p class="subtitle">Search & Extract Direct Download Links</p>
     
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
@@ -513,7 +618,7 @@ async function handleRequest(request, env) {
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting links with JS support (approx ~15 seconds)...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Bypassing Tokens & Timers (approx ~12 seconds)...</div>';
         
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
@@ -594,7 +699,7 @@ async function handleRequest(request, env) {
     if (!pageUrl) return new Response(JSON.stringify({ links: [], logs: ['✗ No URL provided'] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
 
     try {
-      const result = await extractAllDownloadableLinks(pageUrl, env);
+      const result = await extractAllDownloadableLinks(pageUrl);
       return new Response(JSON.stringify({ links: result.links, logs: result.logs }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     } catch (error) {
       return new Response(JSON.stringify({ links: [], logs: [`✗ Fatal error: ${error.message}`] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
@@ -611,7 +716,7 @@ export default {
     }
 
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request);
     } catch (error) {
       console.error('Worker error:', error);
       return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
