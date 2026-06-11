@@ -1,8 +1,8 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.2.5',
+  version: '0.2.6',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams from MoviesMod with direct download links (Zero Dependency)',
+  description: 'Extracts HTTP streams from MoviesMod with direct download links (Zero Dep & Concurrent)',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -30,43 +30,40 @@ function stripTags(html) {
   return (html || '').replace(/<[^>]*>/g, '').trim();
 }
 
-// Fetcher with retry logic and timeout
-async function fetchWithRetry(url, options = {}, retries = 3) {
-  const timeout = options.timeout || 10000;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+// Fetcher with per-attempt abort scoping and reduced retries
+async function fetchWithRetry(url, options = {}, retries = 2) {
+  const timeout = options.timeout || 15000; // Increased to 15s
 
-  try {
-    for (let attempt = 0; attempt < retries; attempt++) {
-      try {
-        const response = await fetch(url, {
-          ...options,
-          signal: controller.signal,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            ...options.headers,
-          },
-        });
-        clearTimeout(timeoutId);
-        
-        if (response.status === 403 || response.status === 429) {
-          throw new Error(`Blocked: HTTP ${response.status}`);
-        }
-        if (response.status === 404) {
-          throw new Error(`NotFound: HTTP 404`);
-        }
-        return response;
-      } catch (error) {
-        if (error.message.includes('NotFound') || error.message.includes('Blocked')) {
-          throw error;
-        }
-        if (attempt === retries - 1) throw error;
-        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          ...options.headers,
+        },
+      });
+      clearTimeout(timeoutId);
+      
+      if (response.status === 403 || response.status === 429) {
+        throw new Error(`Blocked: HTTP ${response.status}`);
       }
+      if (response.status === 404) {
+        throw new Error(`NotFound: HTTP 404`);
+      }
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error.message.includes('NotFound') || error.message.includes('Blocked')) {
+        throw error;
+      }
+      if (attempt === retries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
     }
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
   }
 }
 
@@ -87,8 +84,6 @@ async function searchMoviesMod(query) {
     const html = await response.text();
 
     const results = [];
-    
-    // Extract individual articles
     const articleRegex = /<article[^>]*>([\s\S]*?)<\/article>/gi;
     let articleMatch;
 
@@ -126,17 +121,13 @@ async function extractDownloadLinks(moviePageUrl, logs) {
     const html = await response.text();
 
     const links = [];
-    
     const contentMatch = html.match(/class=["'][^"']*thecontent[^"']*["'][^>]*>([\s\S]*?)(?:<div class="post-navigation"|<h4 class="total-comments"|<\/article>|<div id="comments")/i);
     if (!contentMatch) {
       logs.push('[Extract] ✗ No .thecontent div found');
       return links;
     }
 
-    const contentHtml = contentMatch[1];
-    
-    // Split DOM sequentially by headers to bind links to their closest preceding header
-    const blocks = contentHtml.split(/(?=<h[2-6])/i);
+    const blocks = contentMatch[1].split(/(?=<h[2-6])/i);
     
     for (const block of blocks) {
       const headerMatch = block.match(/<h[2-6][^>]*>([\s\S]*?)<\/h[2-6]>/i);
@@ -162,7 +153,6 @@ async function extractDownloadLinks(moviePageUrl, logs) {
       while ((linkMatch = linkRegex.exec(block)) !== null) {
         const url = linkMatch[1];
         if (url && (url.includes('modpro') || url.includes('links'))) {
-          logs.push(`[Extract] Evaluated anchor URL: ${url}`);
           links.push({
             quality: quality,
             url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}`,
@@ -180,7 +170,7 @@ async function extractDownloadLinks(moviePageUrl, logs) {
   }
 }
 
-// Resolve SID token payloads (Regex string extraction)
+// Resolve SID token payloads and follow redirects to final target
 async function resolveTechUnblockedLink(sidUrl, logs) {
   logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
@@ -196,11 +186,9 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
       logs.push(`[SID] ✗ Could not find initial token _wp_http or form action.`);
       return null;
     }
-    action1 = new URL(action1, origin).href;
-    logs.push(`[SID] Step 1 passed. Action URL: ${action1}`);
-
+    
     const formData1 = new URLSearchParams({ '_wp_http': wp_http });
-    response = await fetchWithRetry(action1, {
+    response = await fetchWithRetry(new URL(action1, origin).href, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': sidUrl },
       body: formData1.toString(),
@@ -216,13 +204,11 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
       logs.push(`[SID] ✗ Could not find secondary tokens _wp_http2 or token.`);
       return null;
     }
-    action2 = new URL(action2, origin).href;
-    logs.push(`[SID] Step 2 passed. Final action URL: ${action2}`);
 
     const formData2 = new URLSearchParams({ '_wp_http2': wp_http2, token });
-    response = await fetchWithRetry(action2, {
+    response = await fetchWithRetry(new URL(action2, origin).href, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': action1 },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formData2.toString(),
     });
 
@@ -230,18 +216,27 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     
     let matchUrl = getMatch(html, /setAttribute\("href",\s*"([^"]+)"\)/);
     if (!matchUrl) {
-      logs.push(`[SID] ✗ JS payload missing setAttribute. Checking window.location fallback...`);
       const fallbackUrl = getMatch(html, /window\.location\.replace\("([^"]+)"\)/);
-      if(fallbackUrl) {
-          const finalUrl = new URL(fallbackUrl, origin).href;
-          logs.push(`[SID] ✓ Resolved via window.location: ${finalUrl}`);
-          return finalUrl;
-      }
-      return null;
+      if(!fallbackUrl) return null;
+      matchUrl = fallbackUrl;
     }
     
-    const finalUrl = new URL(matchUrl, origin).href;
-    logs.push(`[SID] ✓ Successfully resolved SID: ${finalUrl}`);
+    const intermediateUrl = new URL(matchUrl, origin).href;
+    logs.push(`[SID] Intermediary URL extracted: ${intermediateUrl}`);
+
+    // Stage 2 resolution: Follow the ?go= jump link to the real destination
+    const redirectRes = await fetchWithRetry(intermediateUrl);
+    let finalUrl = redirectRes.url;
+    
+    // Catch Javascript meta-redirects on the destination if HTTP location header is masked
+    const redirectHtml = await redirectRes.text();
+    const jsRedirectMatch = getMatch(redirectHtml, /window\.location(?:\.replace)?\s*\+?=\s*["']([^"']+)["']/i);
+    
+    if (jsRedirectMatch) {
+      finalUrl = new URL(jsRedirectMatch, finalUrl).href;
+    }
+
+    logs.push(`[SID] ✓ Successfully resolved SID path to: ${finalUrl}`);
     return finalUrl;
   } catch (error) {
     logs.push(`[SID] ✗ Exception: ${error.message}`);
@@ -249,14 +244,13 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
   }
 }
 
-// Resolve intermediate routing domains via Regex
+// Resolve intermediate routing domains
 async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
   try {
     const urlObject = new URL(initialUrl);
     const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
 
     if (urlObject.hostname.includes('dramadrip.com')) {
-      logs.push(`[Dramadrip] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
 
@@ -270,7 +264,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
         const text = stripTags(match[2]).toLowerCase();
         
         if (link.includes('episodes.modpro') || link.includes('cinematickit')) {
-          if (!episodePageLink) episodePageLink = link; // Fallback
+          if (!episodePageLink) episodePageLink = link; 
           
           if (seasonMatch && targetQuality) {
             const seasonId = seasonMatch[0].toLowerCase();
@@ -284,11 +278,9 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
       }
 
       if (episodePageLink) {
-        logs.push(`[Dramadrip] Resolved to episode page, executing drill down.`);
         return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logs);
       }
     } else if (urlObject.hostname.includes('episodes.modpro.blog') || urlObject.hostname.includes('cinematickit.org')) {
-      logs.push(`[Episodes] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
 
@@ -300,11 +292,9 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
           finalLinks.push({ server: stripTags(match[2]) || 'Driveseed', url: link });
         }
       }
-      logs.push(`[Episodes] Found ${finalLinks.length} links`);
       return finalLinks;
 
     } else if (urlObject.hostname.includes('modrefer.in') || urlObject.hostname.includes('links.modpro.blog')) {
-      logs.push(`[ModRefer] Processing: ${initialUrl}`);
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
 
@@ -317,12 +307,11 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
         if (url && (url.includes('driveseed') || url.includes('drive') || url.includes('cloud') || url.includes('unblockedgames') || url.includes('urlflix'))) {
           if (!text.toLowerCase().includes('comment')) {
             finalLinks.push({ server: text || 'Direct Link', url });
-            logs.push(`[ModRefer] Extracted target server: ${text}`);
           }
         }
       }
       
-      logs.push(`[ModRefer] Found ${finalLinks.length} valid routing links`);
+      logs.push(`[ModRefer] Found ${finalLinks.length} routing links for ${quality}`);
       return finalLinks;
     }
 
@@ -347,7 +336,6 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
     }
 
     const finalUrl = `https://driveseed.org${redirectMatch[1]}`;
-    logs.push(`[Driveseed] Following JS redirect to ${finalUrl}`);
     const finalResponse = await fetchWithRetry(finalUrl);
     const finalHtml = await finalResponse.text();
 
@@ -382,7 +370,7 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
   }
 }
 
-// Main execution wrapper tying the resolution chains
+// Main execution wrapper tying the resolution chains concurrently
 async function extractAllDownloadableLinks(moviePageUrl) {
   const logs = [];
   logs.push(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
@@ -396,22 +384,33 @@ async function extractAllDownloadableLinks(moviePageUrl) {
 
     const allDownloadableLinks = [];
 
-    for (const link of downloadLinks.slice(0, 10)) {
+    // Run map concurrently to defeat overall worker timeouts (30s limit)
+    const extractionPromises = downloadLinks.slice(0, 6).map(async (link) => {
       try {
-        logs.push(`[Main] Processing quality: ${link.quality}`);
-        
+        logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
         
         for (const targetLink of finalLinks) {
           try {
             let currentUrl = targetLink.url;
 
+            // Handle SID Tokens
             if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
-              logs.push(`[Main] SID link detected, escalating to resolveTechUnblockedLink`);
               const resolvedSid = await resolveTechUnblockedLink(currentUrl, logs);
               if (resolvedSid) currentUrl = resolvedSid;
             }
 
+            // Handle URLFlix Link Shorteners
+            if (currentUrl.includes('urlflix')) {
+              logs.push(`[URLFlix] Resolving bypass for: ${currentUrl}`);
+              const ufRes = await fetchWithRetry(currentUrl, {}, 2);
+              const ufHtml = await ufRes.text();
+              const ufJsMatch = getMatch(ufHtml, /window\.location(?:\.replace)?\s*\+?=\s*["']([^"']+)["']/i);
+              currentUrl = ufJsMatch ? new URL(ufJsMatch, ufRes.url).href : ufRes.url;
+              logs.push(`[URLFlix] ✓ Link followed to: ${currentUrl}`);
+            }
+
+            // Final DriveSeed parsing
             if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
               const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logs);
               
@@ -426,6 +425,7 @@ async function extractAllDownloadableLinks(moviePageUrl) {
                 });
               }
             } else {
+              // Direct URLs that bypass driveseed entirely
               allDownloadableLinks.push({
                 quality: link.quality,
                 server: targetLink.server,
@@ -434,13 +434,16 @@ async function extractAllDownloadableLinks(moviePageUrl) {
               });
             }
           } catch (e) {
-             logs.push(`[Main] ✗ Error with ${targetLink.server}: ${e.message}`);
+             logs.push(`[Main] ✗ TargetLink Error (${targetLink.server}): ${e.message}`);
           }
         }
       } catch (e) {
-        logs.push(`[Main] ✗ Error with quality ${link.quality}: ${e.message}`);
+        logs.push(`[Main] ✗ Quality Parse Error (${link.quality}): ${e.message}`);
       }
-    }
+    });
+
+    // Await all concurrent quality extractions
+    await Promise.all(extractionPromises);
 
     logs.push(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
     return { links: allDownloadableLinks, logs };
@@ -487,7 +490,7 @@ async function handleRequest(request) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (Zero Dep)</p>
+    <p class="subtitle">Search & Extract Direct Download Links (Zero Dep & Concurrent)</p>
     
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
@@ -543,7 +546,7 @@ async function handleRequest(request) {
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting download links...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting links (this takes ~10 seconds)...</div>';
         
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
@@ -578,6 +581,7 @@ async function handleRequest(request) {
                 📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
               </div>
               <span class="result-url">\${link.url}</span>
+              <button class="copy-btn" onclick="window.open('\${link.url}', '_blank')">Open</button>
               <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
             </div>\`;
           });
