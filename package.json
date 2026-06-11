@@ -1,0 +1,16 @@
+{
+  "name": "moviesmod-scraper",
+  "version": "1.0.0",
+  "description": "MoviesMod Scraper with Headless Browser",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^0.0.14"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
+
