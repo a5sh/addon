@@ -114,15 +114,19 @@ async function extractStreamsFromPage(html, pageUrl) {
 
 async function handleRequest(request) {
   const url = new URL(request.url);
-  const path = url.pathname;
+  let path = url.pathname;
+  
+  // Normalize empty path
+  if (!path || path === '') path = '/';
 
-  if (path === '/' || path === '/search' || path === '') {
+  // Debug search & test page (root)
+  if (path === '/' || path === '/search') {
     return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MoviesMod Search</title>
+  <title>MoviesMod Debug Search</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -130,17 +134,16 @@ async function handleRequest(request) {
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
       display: flex;
-      align-items: center;
-      justify-content: center;
       padding: 20px;
     }
     .container {
       background: white;
       border-radius: 12px;
       padding: 40px;
-      max-width: 600px;
+      max-width: 900px;
       width: 100%;
       box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      margin: auto;
     }
     h1 {
       color: #333;
@@ -187,45 +190,104 @@ async function handleRequest(request) {
       background: #ccc;
       cursor: not-allowed;
     }
-    .results {
+    
+    .two-column {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
       margin-top: 30px;
     }
-    .result-item {
-      background: #f5f5f5;
-      padding: 15px;
-      border-radius: 8px;
-      margin-bottom: 12px;
-      border-left: 4px solid #667eea;
+    @media (max-width: 768px) {
+      .two-column {
+        grid-template-columns: 1fr;
+      }
     }
+    
+    .section {
+      background: #f9f9f9;
+      padding: 20px;
+      border-radius: 8px;
+      border: 1px solid #e0e0e0;
+    }
+    
+    .section-title {
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 15px;
+      font-size: 14px;
+      text-transform: uppercase;
+      color: #667eea;
+    }
+    
+    .result-item {
+      background: white;
+      padding: 12px;
+      border-radius: 6px;
+      margin-bottom: 10px;
+      border-left: 3px solid #667eea;
+      word-break: break-word;
+    }
+    
     .result-title {
       font-weight: 600;
       color: #333;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
+      font-size: 13px;
     }
+    
     .result-url {
-      font-size: 12px;
+      font-size: 11px;
       color: #666;
-      word-break: break-all;
-      font-family: monospace;
+      font-family: 'Courier New', monospace;
+      margin-bottom: 6px;
+      overflow-x: auto;
+      background: #f0f0f0;
+      padding: 6px;
+      border-radius: 4px;
     }
+    
+    .copy-btn {
+      font-size: 11px;
+      padding: 4px 12px;
+      background: #e0e0e0;
+      color: #333;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    
+    .copy-btn:hover {
+      background: #d0d0d0;
+    }
+    
+    .copy-btn.copied {
+      background: #4caf50;
+      color: white;
+    }
+    
     .loading {
       text-align: center;
       color: #666;
       padding: 20px;
     }
+    
     .error {
       background: #fee;
       color: #c33;
       padding: 15px;
       border-radius: 8px;
-      margin-top: 20px;
       border-left: 4px solid #c33;
+      margin-bottom: 10px;
     }
+    
     .empty {
       text-align: center;
       color: #999;
-      padding: 40px 20px;
+      padding: 30px 20px;
+      font-size: 14px;
     }
+    
     .help {
       background: #f0f4ff;
       padding: 15px;
@@ -234,19 +296,30 @@ async function handleRequest(request) {
       font-size: 13px;
       line-height: 1.6;
       margin-bottom: 30px;
+      border-left: 4px solid #667eea;
+    }
+    
+    .debug-info {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #856404;
+      margin-top: 10px;
+      font-family: 'Courier New', monospace;
+      max-height: 150px;
+      overflow-y: auto;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🎬 MoviesMod Search</h1>
-    <p class="subtitle">Search for movies and series</p>
+    <h1>🎬 MoviesMod Debug Search</h1>
+    <p class="subtitle">Test scraper before Stremio deployment</p>
     
     <div class="help">
-      <strong>How to use:</strong><br>
-      • Enter a movie or series title<br>
-      • Click Search to find streams<br>
-      • Results show available links from MoviesMod
+      <strong>How to use:</strong> Enter a movie/series title, click Search, and view extracted streams and matched results.
     </div>
 
     <div class="search-box">
@@ -255,43 +328,118 @@ async function handleRequest(request) {
         id="searchInput" 
         placeholder="Search movie or series..." 
         onkeypress="if(event.key==='Enter') search()"
+        autofocus
       >
       <button onclick="search()">Search</button>
     </div>
 
-    <div id="results" class="results"></div>
+    <div id="alert" class="error" style="display: none;"></div>
+
+    <div class="two-column">
+      <div class="section">
+        <div class="section-title">📋 Search Results</div>
+        <div id="searchResults" class="empty">No results yet</div>
+      </div>
+      
+      <div class="section">
+        <div class="section-title">🎥 Extracted Streams</div>
+        <div id="streamResults" class="empty">No streams yet</div>
+      </div>
+    </div>
+
+    <div id="debugInfo"></div>
   </div>
 
   <script>
-    const resultsDiv = document.getElementById('results');
     const searchInput = document.getElementById('searchInput');
+    const searchResultsDiv = document.getElementById('searchResults');
+    const streamResultsDiv = document.getElementById('streamResults');
+    const alertDiv = document.getElementById('alert');
+    const debugInfoDiv = document.getElementById('debugInfo');
+
+    function showAlert(message, type = 'error') {
+      alertDiv.textContent = message;
+      alertDiv.style.display = 'block';
+      alertDiv.className = type === 'error' ? 'error' : 'success';
+    }
+
+    function copyToClipboard(text, button) {
+      navigator.clipboard.writeText(text).then(() => {
+        const original = button.textContent;
+        button.textContent = 'Copied!';
+        button.classList.add('copied');
+        setTimeout(() => {
+          button.textContent = original;
+          button.classList.remove('copied');
+        }, 2000);
+      });
+    }
 
     async function search() {
       const query = searchInput.value.trim();
       if (!query) {
-        resultsDiv.innerHTML = '<div class="empty">Enter a search term</div>';
+        showAlert('Enter a search term', 'warning');
         return;
       }
 
-      resultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+      alertDiv.style.display = 'none';
+      searchResultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+      streamResultsDiv.innerHTML = '';
+      debugInfoDiv.innerHTML = '';
 
       try {
-        const response = await fetch(\`\${window.location.origin}/search-api?q=\${encodeURIComponent(query)}\`);
-        const data = await response.json();
+        // Step 1: Search for movies
+        const searchResponse = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
+        const searchData = await searchResponse.json();
 
-        if (!data.results || data.results.length === 0) {
-          resultsDiv.innerHTML = '<div class="empty">No results found</div>';
+        if (!searchData.results || searchData.results.length === 0) {
+          searchResultsDiv.innerHTML = '<div class="empty">No results found on MoviesMod</div>';
           return;
         }
 
-        resultsDiv.innerHTML = data.results.map((result, idx) => \`
+        // Display search results
+        searchResultsDiv.innerHTML = searchData.results.slice(0, 5).map((result, idx) => \`
           <div class="result-item">
             <div class="result-title">\${idx + 1}. \${result.title}</div>
             <div class="result-url">\${result.url}</div>
+            <button class="copy-btn" onclick="copyToClipboard('\${result.url}', this)">Copy URL</button>
           </div>
         \`).join('');
+
+        // Step 2: Extract streams from first result
+        streamResultsDiv.innerHTML = '<div class="loading">Extracting streams...</div>';
+        
+        const firstResult = searchData.results[0];
+        const streamResponse = await fetch(\`/extract-streams?url=\${encodeURIComponent(firstResult.url)}\`);
+        const streamData = await streamResponse.json();
+
+        if (!streamData.streams || streamData.streams.length === 0) {
+          streamResultsDiv.innerHTML = '<div class="empty">No streams found on page</div>';
+        } else {
+          streamResultsDiv.innerHTML = streamData.streams.map((stream, idx) => \`
+            <div class="result-item">
+              <div class="result-title">\${idx + 1}. Stream Link</div>
+              <div class="result-url">\${stream.url}</div>
+              <button class="copy-btn" onclick="copyToClipboard('\${stream.url}', this)">Copy Link</button>
+            </div>
+          \`).join('');
+        }
+
+        // Debug info
+        if (streamData.debug) {
+          debugInfoDiv.innerHTML = \`
+            <div style="margin-top: 20px;">
+              <div class="section">
+                <div class="section-title">🔍 Debug Info</div>
+                <div class="debug-info">\${streamData.debug}</div>
+              </div>
+            </div>
+          \`;
+        }
+
       } catch (error) {
-        resultsDiv.innerHTML = \`<div class="error">Error: \${error.message}</div>\`;
+        showAlert(\`Error: \${error.message}\`);
+        console.error('Search error:', error);
       }
     }
 
@@ -310,6 +458,42 @@ async function handleRequest(request) {
         'Access-Control-Allow-Origin': '*',
       },
     });
+  }
+
+  // Extract streams from URL (for debugging)
+  if (path === '/extract-streams') {
+    const pageUrl = url.searchParams.get('url');
+    if (!pageUrl) {
+      return new Response(JSON.stringify({ streams: [], error: 'No URL provided' }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+
+    try {
+      const pageResponse = await fetchWithRetry(pageUrl);
+      const pageHtml = await pageResponse.text();
+      const streamUrls = await extractStreamsFromPage(pageHtml, pageUrl);
+
+      const streams = streamUrls.map((url, index) => ({
+        url,
+        title: `Stream ${index + 1}`,
+      }));
+
+      return new Response(JSON.stringify({ 
+        streams,
+        debug: \`Fetched: \${pageUrl}\\nFound: \${streamUrls.length} streams\`
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ 
+        streams: [], 
+        error: error.message,
+        debug: \`Error extracting streams: \${error.message}\`
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
   }
 
   const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
@@ -343,7 +527,7 @@ async function handleRequest(request) {
 
       const streams = streamUrls.map((url, index) => ({
         url,
-        title: `${results[0].title} [${index + 1}]`,
+        title: \`\${results[0].title} [\${index + 1}]\`,
       }));
 
       return new Response(JSON.stringify({ streams }), {
@@ -353,7 +537,7 @@ async function handleRequest(request) {
         },
       });
     } catch (error) {
-      console.error(`Stream error: ${error.message}`);
+      console.error(\`Stream error: \${error.message}\`);
       return new Response(JSON.stringify({ streams: [] }), {
         headers: {
           'Content-Type': 'application/json',
@@ -383,7 +567,7 @@ async function handleRequest(request) {
         },
       });
     } catch (error) {
-      console.error(`Search error: ${error.message}`);
+      console.error(\`Search error: \${error.message}\`);
       return new Response(JSON.stringify({ results: [], error: error.message }), {
         headers: {
           'Content-Type': 'application/json',
@@ -394,7 +578,7 @@ async function handleRequest(request) {
   }
 
   if (path === '/configure') {
-    return new Response(`<!DOCTYPE html>
+    return new Response(\`<!DOCTYPE html>
 <html>
 <head>
   <title>MoviesMod Addon</title>
@@ -408,7 +592,9 @@ async function handleRequest(request) {
     }
     h1 { color: #333; }
     p { color: #666; line-height: 1.6; }
-    code { background: #eee; padding: 2px 6px; }
+    code { background: #eee; padding: 2px 6px; border-radius: 3px; }
+    a { color: #667eea; text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -422,8 +608,9 @@ async function handleRequest(request) {
     <li>Extract streams from MoviesMod</li>
     <li>Multiple source support</li>
   </ul>
+  <p><a href="/">← Back to Debug Search</a></p>
 </body>
-</html>`, {
+</html>\`, {
       headers: { 'Content-Type': 'text/html' },
     });
   }
