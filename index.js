@@ -1,6 +1,6 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.3.0',
+  version: '0.3.1',
   name: 'MoviesMod',
   description: 'Extracts HTTP streams from MoviesMod with direct download links (Concurrent & Stateful)',
   types: ['movie', 'series'],
@@ -50,7 +50,6 @@ async function fetchWithRetry(url, options = {}, retries = 2) {
       if (response.status === 403 || response.status === 429) {
         throw new Error(`Blocked: HTTP ${response.status}`);
       }
-      // Don't throw on 404 immediately, sometimes bypass scripts return 404 for valid states
       return response;
     } catch (error) {
       clearTimeout(timeoutId);
@@ -164,7 +163,11 @@ async function extractDownloadLinks(moviePageUrl, logs) {
 async function resolveTechUnblockedLink(sidUrl, logs) {
   logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
+  
+  // Pre-seed the cookie map to spoof a valid PHP session and pass empty-cookie strict checks
   const cookieMap = new Map();
+  cookieMap.set('PHPSESSID', Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
+  cookieMap.set('cf_clearance', Math.random().toString(36).substring(2, 15));
 
   // Safely parses both HTTP Headers and inline JS for session cookies
   function extractCookies(res, htmlBody) {
@@ -177,21 +180,31 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
         if (sc) headerCookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
       }
 
-      headerCookies.forEach(c => {
-        const pair = c.split(';')[0].trim();
-        const [k, ...v] = pair.split('=');
-        if (k && !['path', 'expires', 'domain'].includes(k.toLowerCase())) {
-          cookieMap.set(k.trim(), v.join('='));
-        }
-      });
+      if (Array.isArray(headerCookies)) {
+        headerCookies.forEach(c => {
+          const pair = c.split(';')[0].trim();
+          const splitIndex = pair.indexOf('=');
+          if (splitIndex !== -1) {
+            const k = pair.slice(0, splitIndex).trim();
+            const v = pair.slice(splitIndex + 1).trim();
+            if (k && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly'].includes(k.toLowerCase())) {
+              cookieMap.set(k, v);
+            }
+          }
+        });
+      }
 
       if (htmlBody) {
-        const jsRegex = /document\.cookie\s*=\s*["']([^"']+)["']/gi;
+        const jsRegex = /document\.cookie\s*=\s*(['"`])([^`'"]+)\1/gi;
         let match;
         while ((match = jsRegex.exec(htmlBody)) !== null) {
-          const pair = match[1].split(';')[0].trim();
-          const [k, ...v] = pair.split('=');
-          if (k) cookieMap.set(k.trim(), v.join('='));
+          const pair = match[2].split(';')[0].trim();
+          const splitIndex = pair.indexOf('=');
+          if (splitIndex !== -1) {
+            const k = pair.slice(0, splitIndex).trim();
+            const v = pair.slice(splitIndex + 1).trim();
+            if (k) cookieMap.set(k, v);
+          }
         }
       }
     } catch (e) {
@@ -200,7 +213,15 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
   }
 
   function getHeaders(referer) {
-    const headers = { 'Upgrade-Insecure-Requests': '1' };
+    const headers = { 
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': referer ? 'same-origin' : 'cross-site',
+      'Upgrade-Insecure-Requests': '1'
+    };
     if (referer) headers['Referer'] = referer;
     if (cookieMap.size > 0) {
       headers['Cookie'] = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
@@ -266,12 +287,13 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     }
     
     const intermediateUrl = new URL(matchUrl, origin).href;
-    logs.push(`[SID] Intermediary URL extracted. Waiting 8s to clear server timer...`);
+    logs.push(`[SID] Intermediary URL extracted. Waiting 8s to clear velocity timer...`);
 
-    // EXPLOIT: Force 8000ms delay to clear the backend "Double Click" velocity anti-bot trap
+    // EXPLOIT: Force 8000ms delay to safely bypass the backend "Double Click" velocity anti-bot trap
     await new Promise(r => setTimeout(r, 8000));
 
     // Step 4: Follow jump link with strict cookie preservation
+    // Setting redirect to 'manual' prevents native fetch from dropping custom Cookie headers on 302 jumps
     const redirectRes = await fetch(intermediateUrl, {
       method: 'GET',
       headers: getHeaders(action2Url),
@@ -280,13 +302,14 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     
     let finalUrl = null;
     
-    // Manual handling of 302/301 redirects to preserve the final driveseed location
+    // Explicitly read HTTP Location to correctly bridge the origin without stripping headers
     if ([301, 302, 307, 308].includes(redirectRes.status)) {
       finalUrl = redirectRes.headers.get('Location');
+      if (finalUrl && finalUrl.startsWith('/')) finalUrl = new URL(finalUrl, origin).href;
     } else {
       const redirectHtml = await redirectRes.text();
       if (redirectHtml.includes("Bad Request")) {
-        logs.push(`[SID] ✗ Target returned Bad Request despite wait limit. Cookie map length: ${cookieMap.size}`);
+        logs.push(`[SID] ✗ Target returned Bad Request. Current Cookie map length: ${cookieMap.size}`);
         return null;
       }
       const jsRedirectMatch = getMatch(redirectHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
@@ -442,13 +465,13 @@ async function extractAllDownloadableLinks(moviePageUrl) {
 
     const allDownloadableLinks = [];
 
-    // Concurrent execution to ensure 8 second delays execute simultaneously without triggering 30s CF timeout
+    // Map concurrently to avoid stacking the 8-second timers and breaching the 30s Cloudflare wall-clock limit
     const extractionPromises = downloadLinks.slice(0, 6).map(async (link) => {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
         
-        // Process ONLY the primary Fast Server to preserve Cloudflare's 50 fetch subrequest limit
+        // LIMIT TO PRIMARY SERVER TO AVOID CLOUDFLARE 50 SUBREQUEST LIMIT
         const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
         const targetsToProcess = primaryTarget ? [primaryTarget] : [];
 
@@ -500,7 +523,6 @@ async function extractAllDownloadableLinks(moviePageUrl) {
       }
     });
 
-    // Wait for all qualities to finish resolving concurrently
     await Promise.all(extractionPromises);
 
     logs.push(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
