@@ -1,8 +1,8 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.2.1',
+  version: '0.2.2',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams from MoviesMod with advanced resolution',
+  description: 'Extracts HTTP streams from MoviesMod with direct download links',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -13,7 +13,7 @@ const MANIFEST = {
   },
 };
 
-const MOVIESMOD_BASE = 'https://moviesmod.money';
+const MOVIESMOD_BASE = 'https://moviesmod.army';
 
 // Cache for search results and extracted streams
 const cache = new Map();
@@ -451,119 +451,30 @@ async function resolveDriveseedLink(driveseedUrl) {
   }
 }
 
-// Resolve final download URL
-async function resolveFinalDownloadUrl(downloadOption) {
+// Extract all downloadable links from a movie page
+async function extractAllDownloadableLinks(moviePageUrl) {
   try {
-    if (downloadOption.type === 'instant') {
-      const response = await fetchWithRetry(downloadOption.url);
-      const html = await response.text();
-
-      // Check if it's a direct CDN link
-      if (downloadOption.url.includes('workers.dev') || downloadOption.url.includes('cdn.')) {
-        return downloadOption.url;
-      }
-
-      // Try API extraction for video-seed.pro
-      const urlParams = new URL(downloadOption.url).searchParams;
-      const keys = urlParams.get('url');
-      if (keys) {
-        const apiUrl = new URL(downloadOption.url).origin + '/api';
-        const formData = new URLSearchParams({ keys });
-        const apiResponse = await fetchWithRetry(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'x-token': new URL(downloadOption.url).hostname,
-          },
-          body: formData.toString(),
-        });
-        const result = await apiResponse.json();
-        if (result && result.url) return result.url;
-      }
-    } else if (downloadOption.type === 'resume') {
-      const response = await fetchWithRetry(downloadOption.url);
-      const html = await response.text();
-      
-      const linkMatch = html.match(/href=["']([^"']*(?:workers\.dev|\.r2\.dev)[^"']*)["']/);
-      if (linkMatch) return linkMatch[1];
-    } else if (downloadOption.type === 'worker') {
-      const response = await fetchWithRetry(downloadOption.url);
-      const html = await response.text();
-
-      const tokenMatch = html.match(/formData\.append\('token',\s*'([^']+)'\)/);
-      const idMatch = html.match(/fetch\('\/download\?id=([^']+)',/);
-
-      if (tokenMatch && idMatch) {
-        const token = tokenMatch[1];
-        const id = idMatch[1];
-        const apiUrl = `${new URL(downloadOption.url).origin}/download?id=${id}`;
-        const formData = new URLSearchParams({ token });
-        
-        const apiResponse = await fetchWithRetry(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': downloadOption.url,
-          },
-          body: formData.toString(),
-        });
-        const result = await apiResponse.json();
-        if (result && result.url) return result.url;
-      }
+    console.log(`[Extract] Getting all downloadable links from: ${moviePageUrl}`);
+    const downloadLinks = await extractDownloadLinks(moviePageUrl);
+    
+    if (downloadLinks.length === 0) {
+      console.log(`[Extract] No download links found`);
+      return [];
     }
 
-    return null;
-  } catch (error) {
-    console.error(`Error resolving final URL:`, error.message);
-    return null;
-  }
-}
+    const allDownloadableLinks = [];
 
-// Extract quality from text
-function parseQualityForSort(qualityString) {
-  if (!qualityString) return 0;
-  const match = qualityString.match(/(\d{3,4})p/i);
-  return match ? parseInt(match[1], 10) : 0;
-}
-
-// Main stream extraction
-async function extractStreamsFromMoviesMod(tmdbId, mediaType, seasonNum = null, episodeNum = null, title = null, year = null) {
-  try {
-    if (!title) throw new Error('Title is required');
-
-    console.log(`[MoviesMod] Fetching for: ${title} (${year})`);
-
-    // Search
-    const searchResults = await searchMoviesMod(title);
-    if (searchResults.length === 0) throw new Error(`No search results for "${title}"`);
-
-    // Find best match
-    const titles = searchResults.map(r => r.title);
-    const bestMatch = findBestMatch(title, titles);
-    
-    if (bestMatch.rating < 0.3) throw new Error(`No suitable match found (best similarity: ${bestMatch.rating})`);
-
-    const selectedResult = searchResults[bestMatch.index];
-    console.log(`[MoviesMod] Selected: ${selectedResult.title} (similarity: ${bestMatch.rating.toFixed(2)})`);
-
-    // Extract links
-    const downloadLinks = await extractDownloadLinks(selectedResult.url);
-    if (downloadLinks.length === 0) throw new Error('No download links found');
-
-    // Filter and process
-    let relevantLinks = downloadLinks.filter(l => !l.quality.toLowerCase().includes('480p'));
-    if (mediaType === 'tv' && seasonNum !== null) {
-      relevantLinks = relevantLinks.filter(l => 
-        l.quality.toLowerCase().includes(`season ${seasonNum}`) ||
-        l.quality.toLowerCase().includes(`s${seasonNum}`)
-      );
-    }
-
-    const streams = [];
-    
-    for (const link of relevantLinks.slice(0, 5)) {
+    for (const link of downloadLinks.slice(0, 8)) {
       try {
-        const finalLinks = await resolveIntermediateLink(link.url, selectedResult.url, link.quality);
+        console.log(`[Extract] Processing quality: ${link.quality}`);
+        
+        // Skip 480p
+        if (link.quality.toLowerCase().includes('480p')) {
+          console.log(`[Extract] Skipping 480p: ${link.quality}`);
+          continue;
+        }
+
+        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality);
         
         for (const targetLink of finalLinks) {
           try {
@@ -571,8 +482,11 @@ async function extractStreamsFromMoviesMod(tmdbId, mediaType, seasonNum = null, 
 
             // Handle SID links
             if (currentUrl.includes('tech.unblockedgames') || currentUrl.includes('tech.creativeexpressions')) {
-              currentUrl = await resolveTechUnblockedLink(currentUrl);
-              if (!currentUrl) continue;
+              console.log(`[Extract] Resolving SID link...`);
+              const resolvedSid = await resolveTechUnblockedLink(currentUrl);
+              if (resolvedSid) {
+                currentUrl = resolvedSid;
+              }
             }
 
             // Resolve driveseed
@@ -580,34 +494,29 @@ async function extractStreamsFromMoviesMod(tmdbId, mediaType, seasonNum = null, 
               const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl);
               
               for (const option of downloadOptions) {
-                const finalUrl = await resolveFinalDownloadUrl(option);
-                if (finalUrl) {
-                  const quality = link.quality.match(/(\d{3,4})p/i)?.[1] || 'Unknown';
-                  streams.push({
-                    name: `MoviesMod\n${quality}p`,
-                    title: `${fileName || title}\n${size || 'Unknown size'}`,
-                    url: finalUrl,
-                    quality,
-                  });
-                  break; // Use first successful download method
-                }
+                allDownloadableLinks.push({
+                  quality: link.quality,
+                  server: targetLink.server,
+                  method: option.title,
+                  url: option.url,
+                  size,
+                  fileName,
+                });
               }
             }
           } catch (e) {
-            console.error(`Error processing ${targetLink.server}:`, e.message);
+            console.error(`[Extract] Error with ${targetLink.server}:`, e.message);
           }
         }
       } catch (e) {
-        console.error(`Error processing quality ${link.quality}:`, e.message);
+        console.error(`[Extract] Error with quality ${link.quality}:`, e.message);
       }
     }
 
-    // Sort by quality
-    streams.sort((a, b) => parseInt(b.quality) - parseInt(a.quality));
-    console.log(`[MoviesMod] ✓ Extracted ${streams.length} streams`);
-    return streams;
+    console.log(`[Extract] ✓ Found ${allDownloadableLinks.length} total downloadable links`);
+    return allDownloadableLinks;
   } catch (error) {
-    console.error(`[MoviesMod] ✗ Error:`, error.message);
+    console.error(`[Extract] ✗ Error:`, error.message);
     return [];
   }
 }
@@ -626,29 +535,33 @@ async function handleRequest(request) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MoviesMod Debug</title>
+  <title>MoviesMod Enhanced Scraper</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
-      display: flex;
       padding: 20px;
     }
     .container {
       background: white;
       border-radius: 12px;
       padding: 40px;
-      max-width: 900px;
-      width: 100%;
+      max-width: 1200px;
+      margin: 0 auto;
       box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-      margin: auto;
     }
     h1 {
       color: #333;
       margin-bottom: 10px;
       text-align: center;
+    }
+    .subtitle {
+      color: #666;
+      text-align: center;
+      margin-bottom: 30px;
+      font-size: 14px;
     }
     .search-box {
       display: flex;
@@ -677,29 +590,71 @@ async function handleRequest(request) {
     button:hover {
       background: #764ba2;
     }
-    .results {
+    .two-column {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
       margin-top: 30px;
     }
-    .result-item {
-      background: #f5f5f5;
-      padding: 15px;
+    @media (max-width: 768px) {
+      .two-column {
+        grid-template-columns: 1fr;
+      }
+    }
+    .section {
+      background: #f9f9f9;
+      padding: 20px;
       border-radius: 8px;
-      margin-bottom: 12px;
-      border-left: 4px solid #667eea;
+      border: 1px solid #e0e0e0;
+    }
+    .section-title {
+      font-weight: 600;
+      color: #667eea;
+      margin-bottom: 15px;
+      font-size: 14px;
+      text-transform: uppercase;
+    }
+    .result-item {
+      background: white;
+      padding: 12px;
+      border-radius: 6px;
+      margin-bottom: 10px;
+      border-left: 3px solid #667eea;
+      word-break: break-word;
     }
     .result-title {
       font-weight: 600;
       color: #333;
       margin-bottom: 6px;
+      font-size: 13px;
     }
     .result-url {
-      font-size: 12px;
+      font-size: 11px;
       color: #666;
-      word-break: break-all;
       font-family: monospace;
-      background: #eee;
+      background: #f0f0f0;
       padding: 6px;
       border-radius: 4px;
+      margin-bottom: 6px;
+      display: block;
+      overflow-x: auto;
+    }
+    .result-meta {
+      font-size: 11px;
+      color: #999;
+      margin-top: 6px;
+    }
+    .copy-btn {
+      font-size: 10px;
+      padding: 4px 12px;
+      background: #e0e0e0;
+      color: #333;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .copy-btn:hover {
+      background: #d0d0d0;
     }
     .loading {
       text-align: center;
@@ -711,25 +666,27 @@ async function handleRequest(request) {
       color: #c33;
       padding: 15px;
       border-radius: 8px;
-      margin-top: 20px;
       border-left: 4px solid #c33;
+      margin-top: 20px;
     }
     .empty {
       text-align: center;
       color: #999;
-      padding: 40px 20px;
+      padding: 30px 20px;
+      font-size: 14px;
     }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
+    <p class="subtitle">Search & Extract Direct Download Links</p>
     
     <div class="search-box">
       <input 
         type="text" 
         id="searchInput" 
-        placeholder="Search movie title..." 
+        placeholder="Search movie or series..." 
         onkeypress="if(event.key==='Enter') search()"
         autofocus
       >
@@ -737,7 +694,18 @@ async function handleRequest(request) {
     </div>
 
     <div id="alert" class="error" style="display: none;"></div>
-    <div id="results" class="results"></div>
+
+    <div class="two-column">
+      <div class="section">
+        <div class="section-title">📽️ Movie Pages</div>
+        <div id="pageResults" class="empty">Search to see results</div>
+      </div>
+      
+      <div class="section">
+        <div class="section-title">🔗 Download Links</div>
+        <div id="downloadResults" class="empty">Links appear here</div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -745,31 +713,81 @@ async function handleRequest(request) {
       const query = document.getElementById('searchInput').value.trim();
       if (!query) return;
 
-      const resultsDiv = document.getElementById('results');
+      const pageDiv = document.getElementById('pageResults');
+      const downloadDiv = document.getElementById('downloadResults');
       const alertDiv = document.getElementById('alert');
       
       alertDiv.style.display = 'none';
-      resultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+      pageDiv.innerHTML = '<div class="loading">Searching movies...</div>';
+      downloadDiv.innerHTML = '';
 
       try {
-        const response = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
-        const data = await response.json();
+        // Get movie pages
+        const pageResponse = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
+        const pageData = await pageResponse.json();
 
-        if (!data.results || data.results.length === 0) {
-          resultsDiv.innerHTML = '<div class="empty">No results found</div>';
+        if (!pageData.results || pageData.results.length === 0) {
+          pageDiv.innerHTML = '<div class="empty">No results found</div>';
           return;
         }
 
-        resultsDiv.innerHTML = data.results.map((r, i) => \`
+        // Display movie pages
+        pageDiv.innerHTML = pageData.results.map((r, i) => \`
           <div class="result-item">
             <div class="result-title">\${i + 1}. \${r.title}</div>
-            <div class="result-url">\${r.url}</div>
+            <span class="result-url">\${r.url}</span>
+            <button class="copy-btn" onclick="copyText('\${r.url}')">Copy URL</button>
           </div>
         \`).join('');
+
+        // Extract download links
+        downloadDiv.innerHTML = '<div class="loading">Extracting download links...</div>';
+        
+        const firstResult = pageData.results[0];
+        const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
+        const linksData = await linksResponse.json();
+
+        if (!linksData.links || linksData.links.length === 0) {
+          downloadDiv.innerHTML = '<div class="empty">No downloadable links found</div>';
+          return;
+        }
+
+        // Group links by quality
+        const grouped = {};
+        linksData.links.forEach(link => {
+          if (!grouped[link.quality]) grouped[link.quality] = [];
+          grouped[link.quality].push(link);
+        });
+
+        let html = '';
+        Object.keys(grouped).forEach(quality => {
+          html += \`<div style="margin-bottom: 15px;">
+            <div class="result-title">\${quality}</div>\`;
+          
+          grouped[quality].forEach(link => {
+            html += \`<div style="margin-left: 10px; margin-bottom: 8px;">
+              <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
+                📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
+              </div>
+              <span class="result-url">\${link.url}</span>
+              <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
+            </div>\`;
+          });
+          
+          html += '</div>';
+        });
+
+        downloadDiv.innerHTML = html;
+
       } catch (error) {
         alertDiv.textContent = \`Error: \${error.message}\`;
         alertDiv.style.display = 'block';
       }
+    }
+
+    function copyText(text) {
+      navigator.clipboard.writeText(text);
+      alert('Copied to clipboard!');
     }
   </script>
 </body>
@@ -806,6 +824,28 @@ async function handleRequest(request) {
     }
   }
 
+  // Extract links API
+  if (path === '/extract-links') {
+    const pageUrl = url.searchParams.get('url');
+    if (!pageUrl) {
+      return new Response(JSON.stringify({ links: [] }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+
+    try {
+      const links = await extractAllDownloadableLinks(pageUrl);
+      return new Response(JSON.stringify({ links }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    } catch (error) {
+      console.error(`Error extracting links:`, error.message);
+      return new Response(JSON.stringify({ links: [], error: error.message }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+  }
+
   // Stremio stream endpoint
   const streamMatch = path.match(/^\/stream\/([^\/]+)\/([^\/]+)\.json$/);
   if (streamMatch) {
@@ -819,17 +859,8 @@ async function handleRequest(request) {
         });
       }
 
-      // For demo purposes - would need title from TMDB API in production
-      const streams = await extractStreamsFromMoviesMod(id, type, null, null, 'Movie Title', '2024');
-
-      return new Response(JSON.stringify({ streams: streams.map(s => ({
-        name: s.name,
-        title: s.title,
-        url: s.url,
-        type: 'url',
-        availability: 2,
-        behaviorHints: { notWebReady: true },
-      })) }), {
+      // For production, would need title from TMDB API
+      return new Response(JSON.stringify({ streams: [] }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     } catch (error) {
