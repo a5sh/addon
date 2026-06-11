@@ -171,7 +171,7 @@ async function searchMoviesMod(query) {
   }
 }
 
-// FIXED: Extract download links from page
+// Extract download links from page
 async function extractDownloadLinks(moviePageUrl) {
   try {
     const response = await fetchWithRetry(moviePageUrl);
@@ -188,8 +188,7 @@ async function extractDownloadLinks(moviePageUrl) {
 
     const contentHtml = contentBox[1];
 
-    // FIXED: Match h4 headers with quality info followed by download links
-    // Pattern: <h4...>Quality Info</h4><p...><a href="...">Download Links</a></p>
+    // Match h4 headers with quality info followed by download links
     const h4Regex = /<h4[^>]*>([\s\S]*?)<\/h4>\s*<p[^>]*>\s*<a[^>]*href=["']([^"']*?)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let headerMatch;
 
@@ -229,7 +228,7 @@ async function extractDownloadLinks(moviePageUrl) {
   }
 }
 
-// Resolve SID (tech.unblockedgames.world) links
+// Resolve SID (tech.unblockedgames.world / cloud.unblockedgames.world) links
 async function resolveTechUnblockedLink(sidUrl) {
   console.log(`[SID] Resolving: ${sidUrl.substring(0, 80)}...`);
   const { origin } = new URL(sidUrl);
@@ -366,22 +365,23 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality) {
 
       const finalLinks = [];
       
-      // Look for direct download links
-      const linkRegex = /<a\s+href=["']([^"']+?)["'][^>]*>([^<]*?)<\/a>/gi;
+      // Captures all content up to the closing tag across lines, bypassing nested constraints
+      const linkRegex = /<a\s+href=["']([^"']+?)["'][^>]*>([\s\S]*?)<\/a>/gi;
       let match;
       
       while ((match = linkRegex.exec(html)) !== null) {
         const url = match[1];
-        const text = match[2];
+        // Clean out child tags like <span> or <strong> to yield pure string descriptors
+        const text = match[2].replace(/<[^>]*>/g, '').trim();
         
-        // Filter for actual download services (driveseed, etc)
-        if (url && text && 
-            (url.includes('driveseed') || url.includes('drive') || url.includes('cloud')) &&
-            !text.toLowerCase().includes('comment')) {
-          finalLinks.push({ 
-            server: text.trim() || 'Direct Link', 
-            url 
-          });
+        // Filter for actual download services (driveseed, cloud, etc)
+        if (url && (url.includes('driveseed') || url.includes('drive') || url.includes('cloud'))) {
+          if (!text.toLowerCase().includes('comment')) {
+            finalLinks.push({ 
+              server: text || 'Direct Link', 
+              url 
+            });
+          }
         }
       }
       
@@ -462,7 +462,7 @@ async function resolveDriveseedLink(driveseedUrl) {
   }
 }
 
-// FIXED: Extract all downloadable links from a movie page
+// Extract all downloadable links from a movie page
 async function extractAllDownloadableLinks(moviePageUrl) {
   try {
     console.log(`[Extract] Getting all downloadable links from: ${moviePageUrl}`);
@@ -491,8 +491,8 @@ async function extractAllDownloadableLinks(moviePageUrl) {
           try {
             let currentUrl = targetLink.url;
 
-            // Handle SID links
-            if (currentUrl.includes('tech.unblockedgames') || currentUrl.includes('tech.creativeexpressions')) {
+            // Handle SID links safely across subdomain transitions (tech -> cloud)
+            if (currentUrl.includes('unblockedgames.world') || currentUrl.includes('tech.creativeexpressions')) {
               console.log(`[Extract] Resolving SID link...`);
               const resolvedSid = await resolveTechUnblockedLink(currentUrl);
               if (resolvedSid) {
