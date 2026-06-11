@@ -2,3 +2,4 @@ name = "addon"
 type = "javascript"
 account_id = "381e7575580a02003bd9a2d345c9e757"
 workers_dev = true
+main = "index.js"
