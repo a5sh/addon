@@ -16,26 +16,28 @@ const MOVIESMOD_BASE = 'https://moviesmod.army';
 const cache = new Map();
 const CACHE_TTL = 6 * 60 * 60 * 1000;
 
+// Helper to escape HTML
+function escapeHtml(text) {
+  const map = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;'
+  };
+  return text.replace(/[&<>"']/g, m => map[m]);
+}
+
 // ============================================================================
 // NUVIO-STYLE SID RESOLVER (No Puppeteer needed!)
 // ============================================================================
 
-/**
- * Resolve tech.unblockedgames.world SID links to driveleech URLs
- * Based on Nuvio's approach: pure HTTP + form submission + regex extraction
- * 
- * The key insight: Don't click buttons in a browser, just submit forms via fetch()
- * and extract dynamic values using regex patterns
- */
 async function resolveTechUnblockedLink(sidUrl, logger) {
   logger(`[SID] Starting Nuvio-style resolution...`);
-  
   const origin = new URL(sidUrl).origin;
 
   try {
-    // ========== STEP 0: Load initial page and extract form data ==========
     logger(`[SID] Step 0: Loading initial page...`);
-    
     const response0 = await fetch(sidUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -44,15 +46,12 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     });
 
     const html0 = await response0.text();
-
-    // Extract _wp_http from form input
     const wp_httpMatch = html0.match(/<input[^>]*name=["']_wp_http["'][^>]*value=["']([^"']+)["']/i);
     if (!wp_httpMatch?.[1]) {
       logger(`[SID] ✗ Could not find _wp_http in form`);
       return null;
     }
 
-    // Extract form action
     const actionMatch = html0.match(/<form[^>]*action=["']([^"']+)["']/i);
     if (!actionMatch?.[1]) {
       logger(`[SID] ✗ Could not find form action`);
@@ -63,9 +62,7 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     const action1 = actionMatch[1];
     logger(`[SID] ✓ Step 0: Extracted form data`);
 
-    // ========== STEP 1: Submit first form ==========
     logger(`[SID] Step 1: Submitting form...`);
-
     const formData1 = new URLSearchParams();
     formData1.append('_wp_http', wp_http);
 
@@ -82,9 +79,7 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     const html1 = await response1.text();
     logger(`[SID] ✓ Step 1: Form submitted`);
 
-    // ========== STEP 2: Extract verification data ==========
     logger(`[SID] Step 2: Extracting verification data...`);
-
     const wp_http2Match = html1.match(/<input[^>]*name=["']_wp_http2["'][^>]*value=["']([^"']+)["']/i);
     const tokenMatch = html1.match(/<input[^>]*name=["']token["'][^>]*value=["']([^"']+)["']/i);
     const action2Match = html1.match(/<form[^>]*action=["']([^"']+)["']/i);
@@ -99,9 +94,7 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     const action2 = action2Match[1];
     logger(`[SID] ✓ Step 2: Extracted verification data`);
 
-    // ========== STEP 3: Submit verification form ==========
     logger(`[SID] Step 3: Submitting verification...`);
-
     const formData2 = new URLSearchParams();
     formData2.append('_wp_http2', wp_http2);
     formData2.append('token', token);
@@ -119,13 +112,8 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     const html2 = await response2.text();
     logger(`[SID] ✓ Step 3: Verification submitted`);
 
-    // ========== STEP 4: Extract dynamic values from JavaScript ==========
     logger(`[SID] Step 4: Extracting dynamic values...`);
-
-    // Pattern 1: s_343('cookieName', 'cookieValue')
     const cookieMatch = html2.match(/s_343\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)/);
-    
-    // Pattern 2: setAttribute("href", "linkPath")
     const linkMatch = html2.match(/setAttribute\s*\(\s*["']href["']\s*,\s*["']([^"']+)["']\s*\)/);
 
     if (!cookieMatch?.[1] || !cookieMatch?.[2] || !linkMatch?.[1]) {
@@ -136,12 +124,9 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     const cookieName = cookieMatch[1];
     const cookieValue = cookieMatch[2];
     const linkPath = linkMatch[1];
-
     logger(`[SID] ✓ Step 4: Found dynamic cookie: ${cookieName}`);
 
-    // ========== STEP 5: Make final request with cookie ==========
     logger(`[SID] Step 5: Fetching with dynamic cookie...`);
-
     const finalUrl = new URL(linkPath, origin).href;
     const cookieHeader = `${cookieName}=${cookieValue}`;
 
@@ -156,9 +141,7 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
     const html3 = await response3.text();
     logger(`[SID] ✓ Step 5: Got final page`);
 
-    // ========== STEP 6: Extract driveleech URL from meta refresh ==========
     logger(`[SID] Step 6: Extracting driveleech link...`);
-
     const metaMatch = html3.match(/<meta\s+http-equiv=["']refresh["'][^>]*content=["']([^"']+)["']/i);
     if (!metaMatch?.[1]) {
       logger(`[SID] ✗ No meta refresh found`);
@@ -173,7 +156,6 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
 
     const driveleechUrl = urlMatch[1].trim().replace(/["']/g, '');
     logger(`[SID] ✓ SUCCESS: ${driveleechUrl.substring(0, 80)}...`);
-
     return driveleechUrl;
 
   } catch (error) {
@@ -182,9 +164,6 @@ async function resolveTechUnblockedLink(sidUrl, logger) {
   }
 }
 
-/**
- * Extract download options from driveseed page
- */
 async function extractDriveseedOptions(url, logger) {
   logger(`[Driveseed] Fetching: ${url.substring(0, 80)}...`);
 
@@ -194,8 +173,6 @@ async function extractDriveseedOptions(url, logger) {
     });
 
     let html = await response.text();
-
-    // Check for JS redirect
     const redirectMatch = html.match(/window\.location\.replace\s*\(\s*["']([^"']+)["']\s*\)/);
     if (redirectMatch?.[1]) {
       logger(`[Driveseed] Following JS redirect...`);
@@ -206,14 +183,12 @@ async function extractDriveseedOptions(url, logger) {
       html = await redirectResponse.text();
     }
 
-    // Extract metadata
     const sizeMatch = html.match(/Size\s*:\s*([0-9.,]+\s*[KMGT]B)/i);
     const fileMatch = html.match(/Name\s*:\s*([^<\n]+)/i);
 
     const size = sizeMatch?.[1]?.trim() || null;
     const fileName = fileMatch?.[1]?.trim() || null;
 
-    // Extract download buttons
     const options = [];
     const linkRegex = /<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let match;
@@ -231,7 +206,6 @@ async function extractDriveseedOptions(url, logger) {
       }
     }
 
-    // Deduplicate
     const seen = new Set();
     const unique = options.filter(o => {
       if (seen.has(o.url)) return false;
@@ -240,7 +214,6 @@ async function extractDriveseedOptions(url, logger) {
     });
 
     unique.sort((a, b) => a.priority - b.priority);
-
     logger(`[Driveseed] ✓ Found ${unique.length} options`);
     if (fileName) logger(`[Driveseed] File: ${fileName}`);
     if (size) logger(`[Driveseed] Size: ${size}`);
@@ -420,7 +393,6 @@ async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
 
       let currentUrl = primaryTarget.url;
 
-      // Handle SID links
       if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions') || currentUrl.includes('examzculture')) {
         logger(`[Pipeline] Detected SID link, resolving...`);
         const driveleechUrl = await resolveTechUnblockedLink(currentUrl, logger);
@@ -429,7 +401,6 @@ async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
           currentUrl = driveleechUrl;
           logger(`[Pipeline] ✓ SID resolved`);
 
-          // Follow driveleech to driveseed
           const response = await fetch(driveleechUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
           let html = await response.text();
           let finalUrl = response.url || driveleechUrl;
@@ -491,210 +462,196 @@ async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
 // CLOUDFLARE WORKERS HANDLERS
 // ============================================================================
 
+const htmlTemplate = (function() {
+  const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoviesMod Smart Extractor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+.container { background: white; border-radius: 12px; padding: 40px; max-width: 1200px; margin: 0 auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+h1 { color: #333; text-align: center; margin-bottom: 30px; }
+.search-box { display: flex; gap: 10px; margin-bottom: 30px; }
+input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; }
+button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
+button:hover { background: #5568d3; }
+.two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 30px; }
+@media (max-width: 768px) { .two-column { grid-template-columns: 1fr; } }
+.section { background: #f9f9f9; padding: 20px; border-radius: 8px; border: 1px solid #e0e0e0; }
+.section-title { font-weight: 600; color: #667eea; margin-bottom: 15px; text-transform: uppercase; font-size: 12px; }
+.result-item { background: white; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #667eea; }
+.result-title { font-weight: 600; color: #333; margin-bottom: 6px; }
+.result-url { font-size: 11px; color: #666; font-family: monospace; background: #f0f0f0; padding: 8px; border-radius: 4px; margin-bottom: 8px; display: block; overflow-x: auto; word-break: break-all; }
+.btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+.copy-btn { font-size: 10px; padding: 6px 12px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer; }
+.copy-btn:hover { background: #d0d0d0; }
+.empty { text-align: center; color: #999; padding: 30px 20px; }
+.debug-log { font-family: 'Courier New', monospace; font-size: 12px; background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; max-height: 300px; overflow-y: auto; line-height: 1.4; }
+.log-success { color: #6a9955; }
+.log-error { color: #f48771; }
+.log-info { color: #9cdcfe; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🎬 MoviesMod Smart Extractor</h1>
+<div class="search-box">
+<input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key===String.fromCharCode(13)) search()" autofocus>
+<button onclick="search()">Search</button>
+</div>
+<div class="two-column">
+<div class="section">
+<div class="section-title">📽️ Movie Pages</div>
+<div id="pageResults" class="empty">Search to see results</div>
+</div>
+<div class="section">
+<div class="section-title">🔗 Download Links</div>
+<div id="downloadResults" class="empty">Links appear here</div>
+</div>
+</div>
+<div class="section" style="margin-top: 20px;">
+<div class="section-title">🐛 Extraction Logs</div>
+<div class="debug-log" id="debugLogs">Ready...</div>
+</div>
+</div>
+
+<script>
+let activeStream = null;
+
+function search() {
+  const query = document.getElementById('searchInput').value.trim();
+  if (!query) return;
+
+  if (activeStream) activeStream.close();
+
+  document.getElementById('pageResults').innerHTML = '<div class="empty">Searching...</div>';
+  document.getElementById('downloadResults').innerHTML = '';
+  clearLogs();
+
+  fetch('/search-api?q=' + encodeURIComponent(query))
+    .then(res => res.json())
+    .then(data => {
+      if (!data.results || data.results.length === 0) {
+        document.getElementById('pageResults').innerHTML = '<div class="empty">No results</div>';
+        return;
+      }
+
+      let html = '';
+      for (let i = 0; i < data.results.length; i++) {
+        const r = data.results[i];
+        const escapedUrl = r.url.replace(/'/g, '\\\\'').replace(/"/g, '&quot;');
+        html += '<div class="result-item">' +
+                '<div class="result-title">' + (i + 1) + '. ' + r.title + '</div>' +
+                '<span class="result-url">' + r.url + '</span>' +
+                '<div class="btn-group">' +
+                '<button class="copy-btn" onclick="copyText(String.fromCharCode(39) + escapedUrl + String.fromCharCode(39))">Copy</button>' +
+                '<button class="copy-btn" onclick="extractLinks(String.fromCharCode(39) + escapedUrl + String.fromCharCode(39))">Extract</button>' +
+                '</div>' +
+                '</div>';
+      }
+      document.getElementById('pageResults').innerHTML = html;
+    })
+    .catch(e => alert('Error: ' + e.message));
+}
+
+function extractLinks(url) {
+  document.getElementById('downloadResults').innerHTML = '<div class="empty">Extracting...</div>';
+  clearLogs();
+
+  if (activeStream) activeStream.close();
+
+  const es = new EventSource('/extract-links?url=' + encodeURIComponent(url));
+  activeStream = es;
+
+  es.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    
+    if (data.type === 'log') {
+      addLog(data.message);
+    }
+    
+    if (data.type === 'result') {
+      es.close();
+      const links = data.links;
+      
+      if (!links || links.length === 0) {
+        document.getElementById('downloadResults').innerHTML = '<div class="empty">No links found</div>';
+        return;
+      }
+
+      const grouped = {};
+      for (let i = 0; i < links.length; i++) {
+        const l = links[i];
+        if (!grouped[l.quality]) grouped[l.quality] = [];
+        grouped[l.quality].push(l);
+      }
+
+      let html = '';
+      for (const q in grouped) {
+        html += '<div style="margin-bottom: 15px;"><div class="result-title">⭐ ' + q + '</div>';
+        for (let i = 0; i < grouped[q].length; i++) {
+          const l = grouped[q][i];
+          html += '<div style="margin-left: 10px; margin-bottom: 12px;">' +
+                  '<div style="font-size: 11px; color: #666; margin-bottom: 6px;">' +
+                  '📌 ' + l.method + (l.server ? ' • ' + l.server : '') + (l.size ? '<br/>📊 ' + l.size : '') +
+                  '</div>' +
+                  '<span class="result-url">' + l.url + '</span>' +
+                  '<div class="btn-group" style="margin-top: 6px;">' +
+                  '<button class="copy-btn" onclick="copyText(String.fromCharCode(39) + l.url.replace(/String.fromCharCode(39)/g, String.fromCharCode(92) + String.fromCharCode(39)) + String.fromCharCode(39))">Copy</button>' +
+                  '<button class="copy-btn" onclick="window.open(String.fromCharCode(39) + l.url + String.fromCharCode(39), String.fromCharCode(95) + String.fromCharCode(98) + String.fromCharCode(108) + String.fromCharCode(97) + String.fromCharCode(110) + String.fromCharCode(107))">Open</button>' +
+                  '</div>' +
+                  '</div>';
+        }
+        html += '</div>';
+      }
+
+      document.getElementById('downloadResults').innerHTML = html;
+    }
+  };
+
+  es.onerror = () => es.close();
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text);
+  alert('Copied!');
+}
+
+function clearLogs() {
+  document.getElementById('debugLogs').innerHTML = '';
+}
+
+function addLog(msg) {
+  const logs = document.getElementById('debugLogs');
+  const div = document.createElement('div');
+  
+  if (msg.includes('✓')) div.className = 'log-success';
+  else if (msg.includes('✗')) div.className = 'log-error';
+  else div.className = 'log-info';
+  
+  div.textContent = msg;
+  div.style.paddingBottom = '2px';
+  div.style.marginBottom = '4px';
+  div.style.borderBottom = '1px solid #333';
+  
+  logs.appendChild(div);
+  logs.scrollTop = logs.scrollHeight;
+}
+</script>
+</body>
+</html>`;
+  return htmlContent;
+})();
+
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname || '/';
 
   if (path === '/' || path === '/search') {
-    return new Response(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MoviesMod Smart Extractor</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
-    }
-    .container {
-      background: white;
-      border-radius: 12px;
-      padding: 40px;
-      max-width: 1200px;
-      margin: 0 auto;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-    }
-    h1 { color: #333; text-align: center; margin-bottom: 30px; }
-    .search-box { display: flex; gap: 10px; margin-bottom: 30px; }
-    input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; }
-    button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
-    button:hover { background: #5568d3; }
-    .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 30px; }
-    @media (max-width: 768px) { .two-column { grid-template-columns: 1fr; } }
-    .section { background: #f9f9f9; padding: 20px; border-radius: 8px; border: 1px solid #e0e0e0; }
-    .section-title { font-weight: 600; color: #667eea; margin-bottom: 15px; text-transform: uppercase; font-size: 12px; }
-    .result-item { background: white; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #667eea; }
-    .result-title { font-weight: 600; color: #333; margin-bottom: 6px; }
-    .result-url { font-size: 11px; color: #666; font-family: monospace; background: #f0f0f0; padding: 8px; border-radius: 4px; margin-bottom: 8px; display: block; overflow-x: auto; word-break: break-all; }
-    .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
-    .copy-btn { font-size: 10px; padding: 6px 12px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer; }
-    .copy-btn:hover { background: #d0d0d0; }
-    .empty { text-align: center; color: #999; padding: 30px 20px; }
-    .debug-log {
-      font-family: 'Courier New', monospace;
-      font-size: 12px;
-      background: #1e1e1e;
-      color: #d4d4d4;
-      padding: 15px;
-      border-radius: 8px;
-      max-height: 300px;
-      overflow-y: auto;
-      line-height: 1.4;
-    }
-    .log-success { color: #6a9955; }
-    .log-error { color: #f48771; }
-    .log-info { color: #9cdcfe; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🎬 MoviesMod Smart Extractor</h1>
-    <div class="search-box">
-      <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
-      <button onclick="search()">Search</button>
-    </div>
-    <div class="two-column">
-      <div class="section">
-        <div class="section-title">📽️ Movie Pages</div>
-        <div id="pageResults" class="empty">Search to see results</div>
-      </div>
-      <div class="section">
-        <div class="section-title">🔗 Download Links</div>
-        <div id="downloadResults" class="empty">Links appear here</div>
-      </div>
-    </div>
-    <div class="section" style="margin-top: 20px;">
-      <div class="section-title">🐛 Extraction Logs</div>
-      <div class="debug-log" id="debugLogs">Ready...</div>
-    </div>
-  </div>
-
-  <script>
-    let activeStream = null;
-
-    async function search() {
-      const query = document.getElementById('searchInput').value.trim();
-      if (!query) return;
-
-      if (activeStream) activeStream.close();
-
-      document.getElementById('pageResults').innerHTML = '<div class="empty">Searching...</div>';
-      document.getElementById('downloadResults').innerHTML = '';
-      clearLogs();
-
-      try {
-        const res = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
-        const data = await res.json();
-
-        if (!data.results || data.results.length === 0) {
-          document.getElementById('pageResults').innerHTML = '<div class="empty">No results</div>';
-          return;
-        }
-
-        document.getElementById('pageResults').innerHTML = data.results.map((r, i) => \`
-          <div class="result-item">
-            <div class="result-title">\${i + 1}. \${r.title}</div>
-            <span class="result-url">\${r.url}</span>
-            <div class="btn-group">
-              <button class="copy-btn" onclick="copyText('\${r.url}')">Copy</button>
-              <button class="copy-btn" onclick="extractLinks('\${r.url}')">Extract</button>
-            </div>
-          </div>
-        \`).join('');
-
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
-    }
-
-    function extractLinks(url) {
-      document.getElementById('downloadResults').innerHTML = '<div class="empty">Extracting...</div>';
-      clearLogs();
-
-      if (activeStream) activeStream.close();
-
-      const es = new EventSource(\`/extract-links?url=\${encodeURIComponent(url)}\`);
-      activeStream = es;
-
-      es.onmessage = (evt) => {
-        const data = JSON.parse(evt.data);
-        
-        if (data.type === 'log') {
-          addLog(data.message);
-        }
-        
-        if (data.type === 'result') {
-          es.close();
-          const links = data.links;
-          
-          if (!links || links.length === 0) {
-            document.getElementById('downloadResults').innerHTML = '<div class="empty">No links found</div>';
-            return;
-          }
-
-          const grouped = {};
-          links.forEach(l => {
-            if (!grouped[l.quality]) grouped[l.quality] = [];
-            grouped[l.quality].push(l);
-          });
-
-          let html = '';
-          Object.keys(grouped).forEach(q => {
-            html += \`<div style="margin-bottom: 15px;"><div class="result-title">⭐ \${q}</div>\`;
-            grouped[q].forEach(l => {
-              html += \`<div style="margin-left: 10px; margin-bottom: 12px;">
-                <div style="font-size: 11px; color: #666; margin-bottom: 6px;">
-                  📌 \${l.method}\${l.server ? ' • ' + l.server : ''}\${l.size ? '<br/>📊 ' + l.size : ''}
-                </div>
-                <span class="result-url">\${l.url}</span>
-                <div class="btn-group" style="margin-top: 6px;">
-                  <button class="copy-btn" onclick="copyText('\${l.url}')">Copy</button>
-                  <button class="copy-btn" onclick="window.open('\${l.url}','_blank')">Open</button>
-                </div>
-              </div>\`;
-            });
-            html += '</div>';
-          });
-
-          document.getElementById('downloadResults').innerHTML = html;
-        }
-      };
-
-      es.onerror = () => es.close();
-    }
-
-    function copyText(text) {
-      navigator.clipboard.writeText(text);
-      alert('Copied!');
-    }
-
-    function clearLogs() {
-      document.getElementById('debugLogs').innerHTML = '';
-    }
-
-    function addLog(msg) {
-      const logs = document.getElementById('debugLogs');
-      const div = document.createElement('div');
-      
-      if (msg.includes('✓')) div.className = 'log-success';
-      else if (msg.includes('✗')) div.className = 'log-error';
-      else div.className = 'log-info';
-      
-      div.textContent = msg;
-      div.style.paddingBottom = '2px';
-      div.style.marginBottom = '4px';
-      div.style.borderBottom = '1px solid #333';
-      
-      logs.appendChild(div);
-      logs.scrollTop = logs.scrollHeight;
-    }
-  </script>
-</body>
-</html>`, { headers: { 'Content-Type': 'text/html' } });
+    return new Response(htmlTemplate, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
   if (path === '/manifest.json') {
@@ -725,17 +682,17 @@ async function handleRequest(request, env, ctx) {
 
     const streamLogger = async (msg) => {
       try {
-        await writer.write(encoder.encode(\`data: \${JSON.stringify({ type: 'log', message: msg })}\n\n\`));
+        await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'log', message: msg }) + '\n\n'));
       } catch (e) {}
     };
 
     ctx.waitUntil((async () => {
       try {
         const result = await extractAllDownloadableLinks(pageUrl, env, streamLogger);
-        await writer.write(encoder.encode(\`data: \${JSON.stringify({ type: 'result', links: result.links })}\n\n\`));
+        await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'result', links: result.links }) + '\n\n'));
       } catch (error) {
-        await streamLogger(\`[Error] \${error.message}\`);
-        await writer.write(encoder.encode(\`data: \${JSON.stringify({ type: 'result', links: [] })}\n\n\`));
+        await streamLogger('[Error] ' + error.message);
+        await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'result', links: [] }) + '\n\n'));
       } finally {
         await writer.close();
       }
@@ -743,7 +700,7 @@ async function handleRequest(request, env, ctx) {
 
     return new Response(readable, {
       headers: {
-        'Content-Type': 'text/event-stream',
+        'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive'
       }
