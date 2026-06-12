@@ -2,9 +2,9 @@ import puppeteer from "@cloudflare/puppeteer";
 
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.8.0',
-  name: 'MoviesMod',
-  description: 'Extracts HTTP streams using Cloudflare Headless Chromium',
+  version: '0.9.0',
+  name: 'MoviesMod Enhanced',
+  description: 'Serverless link extractor with optimized SID resolution',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -16,13 +16,22 @@ const MOVIESMOD_BASE = 'https://moviesmod.army';
 const cache = new Map();
 const CACHE_TTL = 6 * 60 * 60 * 1000;
 
+// ============================================================================
+// UTILITY FUNCTIONS (inspired by Nuvio Streams)
+// ============================================================================
+
+function stripTags(html) {
+  return (html || '').replace(/<[^>]*>/g, '').trim();
+}
+
 function getMatch(text, regex, index = 1) {
   const match = text.match(regex);
   return match ? match[index] : null;
 }
 
-function stripTags(html) {
-  return (html || '').replace(/<[^>]*>/g, '').trim();
+function extractFromHTML(html, pattern) {
+  const match = html.match(pattern);
+  return match ? match[1] || match[0] : null;
 }
 
 async function fetchWithRetry(url, options = {}, retries = 1) {
@@ -46,10 +55,245 @@ async function fetchWithRetry(url, options = {}, retries = 1) {
       clearTimeout(timeoutId);
       if (error.message.includes('Blocked')) throw error;
       if (attempt === retries) throw error;
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
     }
   }
 }
+
+// ============================================================================
+// LINK RESOLVER (inspired by Nuvio's linkResolver.js)
+// ============================================================================
+
+/**
+ * Resolve SID (tech.unblockedgames.world) link to ?go= redirect
+ * Key improvement: Handles the verify step where ?go= appears after form submission
+ */
+async function resolveSidToGoLink(sidUrl, browser, logger) {
+  logger(`[SID] Starting SID resolution: ${sidUrl.substring(0, 80)}...`);
+
+  if (!browser) {
+    logger(`[SID] ✗ Browser not available`);
+    return null;
+  }
+
+  let page;
+  try {
+    page = await browser.newPage();
+    
+    // Setup request interception to reduce bandwidth
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const rt = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(rt)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    // Step 1: Load the SID page
+    logger(`[SID] Step 1: Loading SID page...`);
+    await page.goto(sidUrl, { 
+      waitUntil: 'domcontentloaded', 
+      timeout: 15000 
+    }).catch(e => logger(`[SID] Warning: ${e.message}`));
+
+    await new Promise(r => setTimeout(r, 1000));
+
+    // Step 2: Check for and handle verify button/form
+    logger(`[SID] Step 2: Looking for verify mechanism...`);
+    
+    // Try multiple button selectors
+    const selectors = [
+      'button[type="submit"]',
+      'a#two_steps_btn',
+      'input[type="submit"]',
+      'button:contains("Verify")',
+      'button:contains("Continue")',
+      'a.btn:contains("Verify")'
+    ];
+
+    let clicked = false;
+    for (const selector of selectors) {
+      try {
+        const element = await page.$(selector);
+        if (element) {
+          logger(`[SID] Step 2: Found and clicking button: ${selector}`);
+          await element.click();
+          await new Promise(r => setTimeout(r, 2000));
+          clicked = true;
+          break;
+        }
+      } catch (e) {
+        // Continue to next selector
+      }
+    }
+
+    if (!clicked) {
+      logger(`[SID] Step 2: No button found, checking for auto-redirects...`);
+      // Wait for potential meta refresh or JS redirect
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // Step 3: Extract ?go= from current page or URL
+    logger(`[SID] Step 3: Extracting ?go= link...`);
+    
+    const currentUrl = page.url();
+    logger(`[SID] Step 3: Current URL: ${currentUrl.substring(0, 100)}...`);
+
+    let goLink = null;
+
+    // Check if current URL already contains ?go=
+    if (currentUrl.includes('?go=')) {
+      goLink = currentUrl;
+      logger(`[SID] ✓ Found ?go= in URL`);
+    } else {
+      // Look in page content
+      const pageContent = await page.content();
+      
+      const patterns = [
+        /href=["']([^"']*\?go=[^"']+)["']/i,
+        /window\.location\.href\s*=\s*["']([^"']*\?go=[^"']+)["']/i,
+        /(https?:[^\s"']+\?go=[^\s"']+)/i,
+        /location\.replace?\s*\(\s*["']([^"']*\?go=[^"']+)["']\s*\)/i
+      ];
+
+      for (const pattern of patterns) {
+        const match = pageContent.match(pattern);
+        if (match) {
+          goLink = match[1] || match[0];
+          logger(`[SID] ✓ Found ?go= in page content`);
+          break;
+        }
+      }
+    }
+
+    if (goLink) {
+      if (!goLink.startsWith('http')) {
+        const origin = new URL(sidUrl).origin;
+        goLink = new URL(goLink, origin).href;
+      }
+      logger(`[SID] ✓ SUCCESS: ${goLink.substring(0, 80)}...`);
+      return goLink;
+    }
+
+    logger(`[SID] ✗ Could not extract ?go= link`);
+    return null;
+
+  } catch (error) {
+    logger(`[SID] ✗ Error: ${error.message}`);
+    return null;
+  } finally {
+    if (page) {
+      try {
+        await page.close();
+      } catch (e) {
+        // Ignore close errors
+      }
+    }
+  }
+}
+
+/**
+ * Follow ?go= redirect to driveseed/driveleech
+ */
+async function followGoRedirect(goUrl, browser, logger) {
+  logger(`[Redirect] Following ?go=: ${goUrl.substring(0, 80)}...`);
+
+  if (!browser) {
+    logger(`[Redirect] ✗ Browser unavailable`);
+    return null;
+  }
+
+  let page;
+  try {
+    page = await browser.newPage();
+    
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const rt = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(rt)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    await page.goto(goUrl, { waitUntil: 'domcontentloaded', timeout: 12000 })
+      .catch(e => logger(`[Redirect] Warning: ${e.message}`));
+
+    await new Promise(r => setTimeout(r, 1500));
+
+    const finalUrl = page.url();
+    const html = await page.content();
+
+    logger(`[Redirect] ✓ Landed: ${finalUrl.substring(0, 80)}...`);
+
+    if (finalUrl.includes('driveseed')) {
+      return { url: finalUrl, html, type: 'driveseed' };
+    } else if (finalUrl.includes('driveleech')) {
+      return { url: finalUrl, html, type: 'driveleech' };
+    }
+
+    return { url: finalUrl, html, type: 'other' };
+
+  } catch (error) {
+    logger(`[Redirect] ✗ Error: ${error.message}`);
+    return null;
+  } finally {
+    if (page) {
+      try {
+        await page.close();
+      } catch (e) {}
+    }
+  }
+}
+
+/**
+ * Extract download buttons from driveseed page
+ */
+async function extractDriveseedOptions(html, logger) {
+  logger(`[Driveseed] Extracting download options...`);
+
+  const downloadOptions = [];
+  const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+
+  while ((match = linkRegex.exec(html)) !== null) {
+    const href = match[1];
+    const text = stripTags(match[2]).toLowerCase();
+
+    if (href.includes('instant') || href.includes('video-seed') || text.includes('instant')) {
+      downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
+    } else if (href.includes('resume') && href.includes('cloud')) {
+      downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
+    } else if (href.includes('worker') || href.includes('workerseed')) {
+      downloadOptions.push({ title: 'Resume Worker Bot', type: 'worker', url: href, priority: 3 });
+    }
+  }
+
+  // Deduplicate
+  const uniqueOptions = [];
+  const seenUrls = new Set();
+  for (const option of downloadOptions) {
+    if (!seenUrls.has(option.url)) {
+      seenUrls.add(option.url);
+      uniqueOptions.push(option);
+    }
+  }
+
+  uniqueOptions.sort((a, b) => a.priority - b.priority);
+
+  const size = getMatch(html, /Size\s*:\s*([0-9.,]+\s*[KMGT]B)/i);
+  const fileName = getMatch(html, /Name\s*:\s*([^<\n]+)/i, 1)?.trim();
+
+  logger(`[Driveseed] ✓ Found ${uniqueOptions.length} options`);
+  return { downloadOptions: uniqueOptions, size, fileName };
+}
+
+// ============================================================================
+// PROVIDER FUNCTIONS (inspired by Nuvio's modular providers)
+// ============================================================================
 
 async function searchMoviesMod(query) {
   const cacheKey = `search:${query}`;
@@ -77,6 +321,7 @@ async function searchMoviesMod(query) {
         }
       }
     }
+
     cache.set(cacheKey, { data: results, timestamp: Date.now() });
     return results;
   } catch (error) {
@@ -85,127 +330,148 @@ async function searchMoviesMod(query) {
 }
 
 async function extractDownloadLinks(moviePageUrl, logger) {
-  try {
-    await logger(`[Extract] Fetching movie page: ${moviePageUrl}`);
-    const response = await fetchWithRetry(moviePageUrl);
-    const html = await response.text();
+  logger(`[Extract] Fetching: ${moviePageUrl.substring(0, 60)}...`);
+  const response = await fetchWithRetry(moviePageUrl);
+  const html = await response.text();
 
-    const links = [];
-    const contentMatch = html.match(/class=["'][^"']*thecontent[^"']*["'][^>]*>([\s\S]*?)(?:<div class="post-navigation"|<h4 class="total-comments"|<\/article>|<div id="comments")/i);
-    if (!contentMatch) {
-      await logger('[Extract] ✗ No .thecontent div found');
-      return links;
-    }
-
-    const blocks = contentMatch[1].split(/(?=<h[2-6])/i);
-    
-    for (const block of blocks) {
-      const headerMatch = block.match(/<h[2-6][^>]*>([\s\S]*?)<\/h[2-6]>/i);
-      const rawHeader = stripTags(headerMatch ? headerMatch[1] : 'Unknown Quality');
-      const qualityMatch = rawHeader.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
-      
-      let quality = rawHeader;
-      if (quality.length > 100 || !qualityMatch) {
-        quality = '';
-        if (qualityMatch) quality += qualityMatch[1];
-        if (!quality) quality = 'Unknown';
-      }
-      quality = quality.trim();
-
-      const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-      let linkMatch;
-      
-      while ((linkMatch = linkRegex.exec(block)) !== null) {
-        const url = linkMatch[1];
-        if (url && (url.includes('modpro') || url.includes('links'))) {
-          links.push({ quality, url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}` });
-        }
-      }
-    }
-    await logger(`[Extract] Found ${links.length} download links`);
-    return links;
-  } catch (error) {
-    await logger(`[Extract] ✗ Error extracting download links: ${error.message}`);
-    return [];
-  }
-}
-
-// FAST: Extract ?go= link via regex from HTML (no browser)
-async function extractGoLink(sidUrl, logger) {
-  try {
-    await logger(`[SID] Fetching SID page: ${sidUrl.substring(0, 60)}...`);
-    const response = await fetchWithRetry(sidUrl);
-    const html = await response.text();
-
-    // Look for ?go= link in two_steps_btn
-    const goMatch = html.match(/id=["']two_steps_btn["'][^>]*href=["']([^"']+\?go=[^"']+)["']/i);
-    if (goMatch) {
-      await logger(`[SID] ✓ Extracted ?go= link`);
-      return goMatch[1];
-    }
-
-    // Fallback: look for any ?go= URL in HTML
-    const anyGoMatch = html.match(/(https?:\/\/[^\s'"]+\?go=[^\s'"]+)/i);
-    if (anyGoMatch) {
-      await logger(`[SID] ✓ Found ?go= via pattern match`);
-      return anyGoMatch[1];
-    }
-
-    await logger(`[SID] ✗ Could not find ?go= link in HTML`);
-    return null;
-  } catch (error) {
-    await logger(`[SID] ✗ Error: ${error.message}`);
-    return null;
-  }
-}
-
-// Use Puppeteer ONLY to follow the ?go= redirect to driveseed
-async function followGoRedirect(goUrl, env, logger) {
-  await logger(`[Redirect] Following ?go= with browser: ${goUrl.substring(0, 60)}...`);
+  const links = [];
+  const contentMatch = html.match(/class=["'][^"']*thecontent[^"']*["'][^>]*>([\s\S]*?)(?:<div class="post-navigation"|<h4 class="total-comments"|<\/article>|<div id="comments")/i);
   
-  if (!env.MYBROWSER) {
-    await logger(`[Redirect] ✗ Browser binding not found`);
-    return null;
+  if (!contentMatch) {
+    logger(`[Extract] ✗ No .thecontent found`);
+    return links;
   }
 
-  let browser;
-  try {
-    browser = await puppeteer.launch(env.MYBROWSER, { protocolTimeout: 30000 });
-    const page = await browser.newPage();
+  const blocks = contentMatch[1].split(/(?=<h[2-6])/i);
+  
+  for (const block of blocks) {
+    const headerMatch = block.match(/<h[2-6][^>]*>([\s\S]*?)<\/h[2-6]>/i);
+    const rawHeader = stripTags(headerMatch ? headerMatch[1] : 'Unknown');
+    const quality = rawHeader.length > 100 ? rawHeader.substring(0, 50) : rawHeader;
+
+    const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let linkMatch;
     
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const rt = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(rt)) {
-        req.abort();
-      } else {
-        req.continue();
+    while ((linkMatch = linkRegex.exec(block)) !== null) {
+      const url = linkMatch[1];
+      if (url && (url.includes('modpro') || url.includes('links') || url.includes('unblockedgames'))) {
+        links.push({ quality, url: url.startsWith('http') ? url : `${MOVIESMOD_BASE}${url}` });
       }
-    });
+    }
+  }
 
-    await page.goto(goUrl, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 1500));
-    
-    const finalUrl = page.url();
-    await logger(`[Redirect] ✓ Landed on: ${finalUrl.substring(0, 80)}...`);
+  logger(`[Extract] ✓ Found ${links.length} links`);
+  return links;
+}
 
-    if (finalUrl.includes('driveseed')) {
-      const html = await page.content();
-      await browser.close();
-      return { url: finalUrl, html };
+async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
+  logger(`[Pipeline] Starting extraction pipeline...`);
+  
+  try {
+    const downloadLinks = await extractDownloadLinks(moviePageUrl, logger);
+    if (downloadLinks.length === 0) {
+      logger(`[Pipeline] ✗ No initial links found`);
+      return { links: [] };
     }
 
-    await browser.close();
-    return { url: finalUrl, html: null };
+    // Get browser instance
+    if (!env.MYBROWSER) {
+      logger(`[Pipeline] ✗ Browser not available`);
+      return { links: [] };
+    }
+
+    const browser = await puppeteer.launch(env.MYBROWSER, { protocolTimeout: 30000 });
+    const allDownloadableLinks = [];
+
+    // Process first quality only to save resources
+    const primaryLink = downloadLinks[0];
+    logger(`[Pipeline] Processing: ${primaryLink.quality}`);
+
+    try {
+      // Resolve intermediate links
+      let finalLinks = await resolveIntermediateLink(primaryLink.url, moviePageUrl, logger);
+      if (!finalLinks || finalLinks.length === 0) {
+        logger(`[Pipeline] ✗ No final links from intermediate resolution`);
+        await browser.close();
+        return { links: [] };
+      }
+
+      // Process primary target
+      const primaryTarget = finalLinks.find(l => l.server.includes('Fast') || l.server.includes('G-Drive')) || finalLinks[0];
+      logger(`[Pipeline] Processing target: ${primaryTarget.server}`);
+
+      let currentUrl = primaryTarget.url;
+
+      // If SID link, resolve it
+      if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions') || currentUrl.includes('examzculture')) {
+        logger(`[Pipeline] Detected SID link, resolving...`);
+        const goLink = await resolveSidToGoLink(currentUrl, browser, logger);
+        
+        if (goLink) {
+          currentUrl = goLink;
+          logger(`[Pipeline] ✓ SID resolved to ?go= link`);
+
+          // Follow the redirect
+          const redirectResult = await followGoRedirect(currentUrl, browser, logger);
+          if (redirectResult && (redirectResult.type === 'driveseed' || redirectResult.type === 'driveleech')) {
+            const { downloadOptions, size, fileName } = await extractDriveseedOptions(redirectResult.html, logger);
+            
+            for (const option of downloadOptions) {
+              allDownloadableLinks.push({
+                quality: primaryLink.quality,
+                server: primaryTarget.server,
+                method: option.title,
+                url: option.url,
+                size,
+                fileName
+              });
+            }
+          }
+        } else {
+          logger(`[Pipeline] ✗ SID resolution failed`);
+        }
+      } else if (currentUrl.includes('driveseed')) {
+        // Direct driveseed link
+        const response = await fetchWithRetry(currentUrl);
+        const html = await response.text();
+        const { downloadOptions, size, fileName } = await extractDriveseedOptions(html, logger);
+        
+        for (const option of downloadOptions) {
+          allDownloadableLinks.push({
+            quality: primaryLink.quality,
+            server: primaryTarget.server,
+            method: option.title,
+            url: option.url,
+            size,
+            fileName
+          });
+        }
+      } else {
+        logger(`[Pipeline] Direct link: ${primaryTarget.server}`);
+        allDownloadableLinks.push({
+          quality: primaryLink.quality,
+          server: primaryTarget.server,
+          method: 'Direct',
+          url: currentUrl
+        });
+      }
+
+    } catch (error) {
+      logger(`[Pipeline] ✗ Error processing link: ${error.message}`);
+    } finally {
+      await browser.close();
+    }
+
+    logger(`[Pipeline] ✓ Complete: ${allDownloadableLinks.length} streams extracted`);
+    return { links: allDownloadableLinks };
 
   } catch (error) {
-    await logger(`[Redirect] ✗ Error: ${error.message}`);
-    if (browser) await browser.close();
-    return null;
+    logger(`[Pipeline] ✗ Fatal: ${error.message}`);
+    return { links: [] };
   }
 }
 
-async function resolveIntermediateLink(initialUrl, refererUrl, quality, logger) {
+async function resolveIntermediateLink(initialUrl, refererUrl, logger) {
   try {
     const urlObject = new URL(initialUrl);
     const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -215,217 +481,159 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logger) 
       const html = await response.text();
       let episodePageLink = null;
       let match;
+
       while ((match = linkRegex.exec(html)) !== null) {
         const link = match[1];
         if (link.includes('episodes.modpro') || link.includes('cinematickit')) {
-          episodePageLink = link; 
+          episodePageLink = link;
           break;
         }
       }
-      if (episodePageLink) return await resolveIntermediateLink(episodePageLink, initialUrl, quality, logger);
+
+      if (episodePageLink) {
+        return await resolveIntermediateLink(episodePageLink, initialUrl, logger);
+      }
     } else if (urlObject.hostname.includes('episodes.modpro.blog') || urlObject.hostname.includes('cinematickit.org')) {
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
       const finalLinks = [];
       let match;
+
       while ((match = linkRegex.exec(html)) !== null) {
-        if (match[1].includes('driveseed')) finalLinks.push({ server: stripTags(match[2]) || 'Driveseed', url: match[1] });
+        if (match[1].includes('driveseed') || match[1].includes('unblockedgames') || match[1].includes('creativeexpressions')) {
+          finalLinks.push({ server: stripTags(match[2]) || 'Server', url: match[1] });
+        }
       }
+
       return finalLinks;
     } else if (urlObject.hostname.includes('modrefer.in') || urlObject.hostname.includes('links.modpro.blog')) {
       const response = await fetchWithRetry(initialUrl, { headers: { 'Referer': refererUrl } });
       const html = await response.text();
       const finalLinks = [];
       let match;
+
       while ((match = linkRegex.exec(html)) !== null) {
         const url = match[1];
         const text = stripTags(match[2]);
-        if (url && (url.includes('driveseed') || url.includes('drive') || url.includes('cloud') || url.includes('unblockedgames') || url.includes('urlflix'))) {
-          if (!text.toLowerCase().includes('comment')) finalLinks.push({ server: text || 'Direct Link', url });
-        }
-      }
-      await logger(`[ModRefer] Found ${finalLinks.length} routing links.`);
-      return finalLinks;
-    }
-    return [];
-  } catch (error) {
-    return [];
-  }
-}
-
-async function resolveDriveseedLink(driveseedUrl, logger) {
-  try {
-    await logger(`[Driveseed] Resolving: ${driveseedUrl}`);
-    const response = await fetchWithRetry(driveseedUrl);
-    let finalHtml = await response.text();
-
-    const redirectMatch = getMatch(finalHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
-    if (redirectMatch) {
-      const finalUrl = redirectMatch.startsWith('http') ? redirectMatch : `https://driveseed.org${redirectMatch.startsWith('/') ? '' : '/'}${redirectMatch}`;
-      const finalResponse = await fetchWithRetry(finalUrl);
-      finalHtml = await finalResponse.text();
-    }
-
-    const downloadOptions = [];
-    const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-    let match;
-
-    while ((match = linkRegex.exec(finalHtml)) !== null) {
-      const href = match[1];
-      const text = stripTags(match[2]).toLowerCase();
-
-      if (href.includes('instant') || href.includes('video-seed')) {
-        if (text.includes('instant')) downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
-      } else if (href.includes('resume')) {
-        downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
-      } else if (href.includes('worker')) {
-        downloadOptions.push({ title: 'Resume Worker Bot', type: 'worker', url: href, priority: 3 });
-      }
-    }
-
-    const size = getMatch(finalHtml, /Size\s*:\s*([0-9.,]+\s*[KMGT]B)/i);
-    const fileName = getMatch(finalHtml, /Name\s*:\s*([^<]+)/i, 1)?.trim() || null;
-
-    downloadOptions.sort((a, b) => a.priority - b.priority);
-    await logger(`[Driveseed] ✓ Found ${downloadOptions.length} download options`);
-    return { downloadOptions, size, fileName };
-  } catch (error) {
-    await logger(`[Driveseed] ✗ Error: ${error.message}`);
-    return { downloadOptions: [], size: null, fileName: null };
-  }
-}
-
-async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
-  await logger(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
-  try {
-    const downloadLinks = await extractDownloadLinks(moviePageUrl, logger);
-    if (downloadLinks.length === 0) {
-      await logger(`[Main] ✗ No initial download links found`);
-      return { links: [] };
-    }
-
-    const allDownloadableLinks = [];
-
-    for (const link of downloadLinks.slice(0, 1)) {
-      try {
-        await logger(`[Main] Evaluating quality layer: ${link.quality}`);
-        const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logger);
-        
-        const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
-        const targetsToProcess = primaryTarget ? [primaryTarget] : [];
-
-        for (const targetLink of targetsToProcess) {
-          try {
-            let currentUrl = targetLink.url;
-
-            // Extract ?go= via regex (FAST - no browser)
-            if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
-              const goLink = await extractGoLink(currentUrl, logger);
-              if (goLink) currentUrl = goLink;
-            }
-
-            // Use Puppeteer ONLY for ?go= redirect (avoids timeout)
-            if (currentUrl.includes('?go=')) {
-              await logger(`[Main] Following ?go= redirect...`);
-              const redirectResult = await followGoRedirect(currentUrl, env, logger);
-              if (redirectResult) {
-                currentUrl = redirectResult.url;
-                // If we got driveseed HTML, parse it
-                if (redirectResult.html && currentUrl.includes('driveseed')) {
-                  const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-                  const downloadOptions = [];
-                  let match;
-
-                  while ((match = linkRegex.exec(redirectResult.html)) !== null) {
-                    const href = match[1];
-                    const text = stripTags(match[2]).toLowerCase();
-
-                    if (href.includes('instant') || href.includes('video-seed')) {
-                      if (text.includes('instant')) downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
-                    } else if (href.includes('resume')) {
-                      downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
-                    } else if (href.includes('worker')) {
-                      downloadOptions.push({ title: 'Resume Worker Bot', type: 'worker', url: href, priority: 3 });
-                    }
-                  }
-
-                  if (downloadOptions.length > 0) {
-                    downloadOptions.sort((a, b) => a.priority - b.priority);
-                    for (const option of downloadOptions) {
-                      allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: option.title, url: option.url, size: null, fileName: null });
-                    }
-                    continue;
-                  }
-                }
-              }
-            }
-
-            // Fallback for driveseed
-            if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
-              const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logger);
-              for (const option of downloadOptions) {
-                allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: option.title, url: option.url, size, fileName });
-              }
-            } else {
-              allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: 'Direct Link', url: currentUrl });
-            }
-          } catch (e) {
-             await logger(`[Main] ✗ TargetLink Error (${targetLink.server}): ${e.message}`);
+        if (url && (url.includes('driveseed') || url.includes('unblockedgames') || url.includes('creativeexpressions') || url.includes('examzculture'))) {
+          if (!text.toLowerCase().includes('comment')) {
+            finalLinks.push({ server: text || 'Link', url });
           }
         }
-      } catch (e) {
-        await logger(`[Main] ✗ Quality Parse Error (${link.quality}): ${e.message}`);
       }
+
+      logger(`[Intermediate] ✓ Found ${finalLinks.length} links`);
+      return finalLinks;
     }
 
-    await logger(`[Main] ✓ Finished. Total links extracted: ${allDownloadableLinks.length}`);
-    return { links: allDownloadableLinks };
+    return [];
   } catch (error) {
-    await logger(`[Main] ✗ Fatal Error: ${error.message}`);
-    return { links: [] };
+    logger(`[Intermediate] ✗ Error: ${error.message}`);
+    return [];
   }
 }
+
+// ============================================================================
+// REQUEST HANDLERS
+// ============================================================================
 
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   let path = url.pathname || '/';
 
+  // Home page
   if (path === '/' || path === '/search') {
     return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MoviesMod Enhanced Scraper</title>
+  <title>MoviesMod Serverless Extractor</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
-    .container { background: white; border-radius: 12px; padding: 40px; max-width: 1200px; margin: 0 auto; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3); }
-    h1 { color: #333; margin-bottom: 10px; text-align: center; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { 
+      background: white;
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 1200px;
+      margin: 0 auto;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    }
+    h1 { color: #333; text-align: center; margin-bottom: 10px; }
     .subtitle { color: #666; text-align: center; margin-bottom: 30px; font-size: 14px; }
     .search-box { display: flex; gap: 10px; margin-bottom: 30px; }
-    input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; }
-    button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; }
+    input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; }
+    button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
+    button:hover { background: #5568d3; }
     .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 30px; }
     @media (max-width: 768px) { .two-column { grid-template-columns: 1fr; } }
     .section { background: #f9f9f9; padding: 20px; border-radius: 8px; border: 1px solid #e0e0e0; }
     .section-title { font-weight: 600; color: #667eea; margin-bottom: 15px; font-size: 14px; text-transform: uppercase; }
-    .result-item { background: white; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #667eea; word-break: break-word; }
+    .result-item { background: white; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #667eea; }
     .result-title { font-weight: 600; color: #333; margin-bottom: 6px; font-size: 13px; }
-    .result-url { font-size: 11px; color: #666; font-family: monospace; background: #f0f0f0; padding: 6px; border-radius: 4px; margin-bottom: 6px; display: block; overflow-x: auto; }
-    .copy-btn { font-size: 10px; padding: 4px 12px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer; }
+    .result-url { 
+      font-size: 11px; 
+      color: #666; 
+      font-family: 'Courier New', monospace;
+      background: #f0f0f0; 
+      padding: 8px; 
+      border-radius: 4px; 
+      margin-bottom: 8px; 
+      display: block; 
+      overflow-x: auto;
+      word-break: break-all;
+    }
+    .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+    .copy-btn { 
+      font-size: 10px; 
+      padding: 6px 12px; 
+      background: #e0e0e0; 
+      color: #333; 
+      border: none; 
+      border-radius: 4px; 
+      cursor: pointer;
+    }
+    .copy-btn:hover { background: #d0d0d0; }
     .loading { text-align: center; color: #666; padding: 20px; }
-    .error { background: #fee; color: #c33; padding: 15px; border-radius: 8px; border-left: 4px solid #c33; margin-top: 20px; }
+    .error { 
+      background: #fee; 
+      color: #c33; 
+      padding: 15px; 
+      border-radius: 8px; 
+      border-left: 4px solid #c33; 
+      margin-top: 20px; 
+    }
     .empty { text-align: center; color: #999; padding: 30px 20px; font-size: 14px; }
+    .debug-log {
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      padding: 15px;
+      border-radius: 8px;
+      max-height: 400px;
+      overflow-y: auto;
+      line-height: 1.4;
+    }
+    .log-error { color: #f48771; }
+    .log-success { color: #6a9955; }
+    .log-info { color: #9cdcfe; }
+    .log-warning { color: #ce9178; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links</p>
+    <h1>🎬 MoviesMod Serverless Extractor</h1>
+    <p class="subtitle">Advanced link extraction with intelligent SID resolution</p>
     
     <div class="search-box">
-      <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
+      <input type="text" id="searchInput" placeholder="Search a movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
       <button onclick="search()">Search</button>
     </div>
 
@@ -444,10 +652,8 @@ async function handleRequest(request, env, ctx) {
     </div>
 
     <div class="section" style="margin-top: 20px;">
-      <div class="section-title">🐛 Debug Logs</div>
-      <div id="debugLogs" style="font-family: monospace; font-size: 12px; background: #fff; padding: 15px; border-radius: 8px; border: 1px solid #e0e0e0; max-height: 400px; overflow-y: auto; color: #444; line-height: 1.5;">
-        Awaiting action...
-      </div>
+      <div class="section-title">🐛 Extraction Logs</div>
+      <div class="debug-log" id="debugLogs">Ready for extraction...</div>
     </div>
   </div>
 
@@ -461,9 +667,9 @@ async function handleRequest(request, env, ctx) {
       if (activeStream) activeStream.close();
 
       document.getElementById('alert').style.display = 'none';
-      document.getElementById('pageResults').innerHTML = '<div class="loading">Searching movies...</div>';
+      document.getElementById('pageResults').innerHTML = '<div class="loading">🔍 Searching...</div>';
       document.getElementById('downloadResults').innerHTML = '';
-      document.getElementById('debugLogs').innerHTML = '<div class="loading">Awaiting trace logs...</div>';
+      clearLogs();
 
       try {
         const pageResponse = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
@@ -478,67 +684,12 @@ async function handleRequest(request, env, ctx) {
           <div class="result-item">
             <div class="result-title">\${i + 1}. \${r.title}</div>
             <span class="result-url">\${r.url}</span>
-            <button class="copy-btn" onclick="copyText('\${r.url}')">Copy URL</button>
+            <div class="btn-group">
+              <button class="copy-btn" onclick="copyText('\${r.url}')">Copy URL</button>
+              <button class="copy-btn" onclick="extractLinks('\${r.url}')">Extract</button>
+            </div>
           </div>
         \`).join('');
-
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting links...</div>';
-        
-        const firstResult = pageData.results[0];
-        const eventSource = new EventSource(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
-        activeStream = eventSource;
-
-        eventSource.onmessage = function(event) {
-          const data = JSON.parse(event.data);
-          
-          if (data.type === 'log') {
-             const log = data.message;
-             const isErr = log.includes('✗');
-             const isPass = log.includes('✓');
-             const color = isErr ? '#c33' : isPass ? '#2a9d8f' : '#444';
-             const debugDiv = document.getElementById('debugLogs');
-             if (debugDiv.innerHTML.includes('Awaiting trace logs...')) debugDiv.innerHTML = '';
-             debugDiv.innerHTML += \`<div style="color: \${color}; border-bottom: 1px solid #eee; padding-bottom: 2px; margin-bottom: 4px;">\${log}</div>\`;
-             debugDiv.scrollTop = debugDiv.scrollHeight;
-          } 
-          
-          if (data.type === 'result') {
-             eventSource.close();
-             const links = data.links;
-             if (!links || links.length === 0) {
-               document.getElementById('downloadResults').innerHTML = '<div class="empty">No downloadable links found</div>';
-               return;
-             }
-
-             const grouped = {};
-             links.forEach(link => {
-               if (!grouped[link.quality]) grouped[link.quality] = [];
-               grouped[link.quality].push(link);
-             });
-
-             let html = '';
-             Object.keys(grouped).forEach(quality => {
-               html += \`<div style="margin-bottom: 15px;"><div class="result-title">\${quality}</div>\`;
-               grouped[quality].forEach(link => {
-                 html += \`<div style="margin-left: 10px; margin-bottom: 8px;">
-                   <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
-                     📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
-                   </div>
-                   <span class="result-url">\${link.url}</span>
-                   <button class="copy-btn" onclick="window.open('\${link.url}', '_blank')">Open</button>
-                   <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
-                 </div>\`;
-               });
-               html += '</div>';
-             });
-
-             document.getElementById('downloadResults').innerHTML = html;
-          }
-        };
-
-        eventSource.onerror = function() {
-           eventSource.close();
-        };
 
       } catch (error) {
         document.getElementById('alert').textContent = \`Error: \${error.message}\`;
@@ -546,9 +697,92 @@ async function handleRequest(request, env, ctx) {
       }
     }
 
+    function extractLinks(url) {
+      document.getElementById('downloadResults').innerHTML = '<div class="loading">⏳ Extracting...</div>';
+      clearLogs();
+
+      if (activeStream) activeStream.close();
+
+      const eventSource = new EventSource(\`/extract-links?url=\${encodeURIComponent(url)}\`);
+      activeStream = eventSource;
+
+      eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'log') {
+          addLog(data.message);
+        } 
+        
+        if (data.type === 'result') {
+          eventSource.close();
+          const links = data.links;
+          
+          if (!links || links.length === 0) {
+            document.getElementById('downloadResults').innerHTML = '<div class="empty">No downloadable links found</div>';
+            return;
+          }
+
+          const grouped = {};
+          links.forEach(link => {
+            if (!grouped[link.quality]) grouped[link.quality] = [];
+            grouped[link.quality].push(link);
+          });
+
+          let html = '';
+          Object.keys(grouped).forEach(quality => {
+            html += \`<div style="margin-bottom: 15px;"><div class="result-title">⭐ \${quality}</div>\`;
+            grouped[quality].forEach(link => {
+              html += \`<div style="margin-left: 10px; margin-bottom: 12px;">
+                <div style="font-size: 11px; color: #666; margin-bottom: 6px;">
+                  📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
+                </div>
+                <span class="result-url">\${link.url}</span>
+                <div class="btn-group" style="margin-top: 6px;">
+                  <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
+                  <button class="copy-btn" onclick="window.open('\${link.url}', '_blank')">Open</button>
+                </div>
+              </div>\`;
+            });
+            html += '</div>';
+          });
+
+          document.getElementById('downloadResults').innerHTML = html;
+        }
+      };
+
+      eventSource.onerror = function() {
+        eventSource.close();
+      };
+    }
+
     function copyText(text) {
       navigator.clipboard.writeText(text);
-      alert('Copied to clipboard!');
+      alert('Copied!');
+    }
+
+    function clearLogs() {
+      document.getElementById('debugLogs').innerHTML = '';
+    }
+
+    function addLog(message) {
+      const logs = document.getElementById('debugLogs');
+      const isError = message.includes('✗');
+      const isSuccess = message.includes('✓');
+      const isWarning = message.includes('⚠');
+      
+      const span = document.createElement('div');
+      if (isError) span.className = 'log-error';
+      else if (isSuccess) span.className = 'log-success';
+      else if (isWarning) span.className = 'log-warning';
+      else span.className = 'log-info';
+      
+      span.textContent = message;
+      span.style.paddingBottom = '2px';
+      span.style.marginBottom = '4px';
+      span.style.borderBottom = '1px solid #333';
+      
+      logs.appendChild(span);
+      logs.scrollTop = logs.scrollHeight;
     }
   </script>
 </body>
@@ -563,13 +797,13 @@ async function handleRequest(request, env, ctx) {
 
   if (path === '/search-api') {
     const query = url.searchParams.get('q');
-    if (!query) return new Response(JSON.stringify({ results: [] }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+    if (!query) return new Response(JSON.stringify({ results: [] }), { headers: { 'Content-Type': 'application/json' } });
 
     try {
       const results = await searchMoviesMod(query);
-      return new Response(JSON.stringify({ results: results.slice(0, 10) }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+      return new Response(JSON.stringify({ results: results.slice(0, 10) }), { headers: { 'Content-Type': 'application/json' } });
     } catch (error) {
-      return new Response(JSON.stringify({ results: [], error: error.message }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+      return new Response(JSON.stringify({ results: [], error: error.message }), { headers: { 'Content-Type': 'application/json' } });
     }
   }
 
@@ -592,7 +826,7 @@ async function handleRequest(request, env, ctx) {
         const result = await extractAllDownloadableLinks(pageUrl, env, streamLogger);
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'result', links: result.links })}\n\n`));
       } catch (error) {
-        await streamLogger(`[Main] ✗ Fatal Error: ${error.message}`);
+        await streamLogger(`[Pipeline] ✗ Fatal: ${error.message}`);
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'result', links: [] })}\n\n`));
       } finally {
         await writer.close();
@@ -603,8 +837,7 @@ async function handleRequest(request, env, ctx) {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*'
+        'Connection': 'keep-alive'
       }
     });
   }
@@ -615,14 +848,23 @@ async function handleRequest(request, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } });
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        }
+      });
     }
 
     try {
       return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Worker error:', error);
-      return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ error: error.message }), { 
+        status: 500, 
+        headers: { 'Content-Type': 'application/json' } 
+      });
     }
   },
 };
