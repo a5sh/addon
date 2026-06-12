@@ -1,6 +1,6 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.4.2',
+  version: '0.5.0',
   name: 'MoviesMod',
   description: 'Extracts HTTP streams from MoviesMod (Custom Cookie Engine & Sub-page Referer)',
   types: ['movie', 'series'],
@@ -16,6 +16,14 @@ const MANIFEST = {
 const MOVIESMOD_BASE = 'https://moviesmod.army';
 const cache = new Map();
 const CACHE_TTL = 6 * 60 * 60 * 1000;
+
+// Target quality for extraction. Change this to retarget (e.g. '720p', '2160p').
+const TARGET_QUALITY = '1080p';
+
+// SID anti-bot wait. Old flow used a hardcoded 10s "velocity trap" delay.
+// We try with NO wait first (cookie-jar fix may be sufficient); if the final
+// hop returns "Bad Request", we retry once with a short wait.
+const SID_RETRY_WAIT_MS = 4000;
 
 function getMatch(text, regex, index = 1) {
   const match = text.match(regex);
@@ -53,19 +61,10 @@ async function fetchWithRetry(url, options = {}, retries = 1) {
 }
 
 // ================================================================================
-// Real Cookie Jar (replaces the old fake/pre-seeded cookieMap approach)
+// Real Cookie Jar
 // ================================================================================
-// The old implementation pre-seeded random PHPSESSID/cf_clearance values and
-// manually replayed Set-Cookie headers across hops. This broke the anti-bot
-// continuity check on the final ?go= endpoint ("Bad Request... Enable Cookies").
-// Nuvio's resolveTechUnblockedLink avoids this entirely by using a real cookie
-// jar (tough-cookie via axios-cookiejar-support) so cookies set at each hop are
-// stored and replayed exactly as a browser would. We replicate that behavior
-// here with a minimal jar implementation on top of fetch.
-
 class SimpleCookieJar {
   constructor() {
-    // key: domain -> Map(cookieName -> cookieValue)
     this.store = new Map();
   }
 
@@ -98,7 +97,6 @@ class SimpleCookieJar {
     }
   }
 
-  // Extract document.cookie = "..." assignments from inline scripts and store them
   setFromHtml(html, url) {
     const domain = this._domainKey(url);
     if (!this.store.has(domain)) this.store.set(domain, new Map());
@@ -140,8 +138,6 @@ class SimpleCookieJar {
 }
 
 // Fetch through the jar: attaches Cookie header from jar, stores Set-Cookie + JS cookies back into jar.
-// Follows redirects manually (redirect: 'manual') so Set-Cookie headers on 302s aren't dropped,
-// and so we can carry Referer correctly across hops like a browser would.
 async function jarFetch(url, options = {}, jar, refererOverride = null) {
   let currentUrl = url;
   let currentReferer = refererOverride;
@@ -176,8 +172,7 @@ async function jarFetch(url, options = {}, jar, refererOverride = null) {
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       let location = res.headers.get('location');
       if (location) {
-        if (location.startsWith('/')) location = new URL(location, currentUrl).href;
-        else location = new URL(location, currentUrl).href;
+        location = new URL(location, currentUrl).href;
 
         let nextOptions = { ...options };
         if (res.status === 302 || res.status === 303) {
@@ -273,18 +268,9 @@ async function extractDownloadLinks(moviePageUrl, logs) {
 }
 
 // ================================================================================
-// SID Resolution (rewritten to follow Nuvio's flow with a real cookie jar)
+// SID Resolution
 // ================================================================================
-// Steps mirror addon resolveTechUnblockedLink / resolveSidToRedirect:
-//  0. GET sidUrl -> form#landing with _wp_http + action
-//  1. POST action with _wp_http -> verification page with form#landing (_wp_http2 + token)
-//  2. POST verification action with _wp_http2 + token -> page containing JS that sets
-//     a dynamic cookie (s_343('name','value')) and a link (c.setAttribute("href","..."))
-//  3. Set that cookie in the jar, then GET the dynamic link with correct Referer
-//  4. Read the resulting ?go= link (or meta refresh / window.location) and follow it
-//     with the jar attached -- this is the step that previously failed with
-//     "Bad Request" because cookies weren't continuous.
-async function resolveTechUnblockedLink(sidUrl, logs) {
+async function resolveTechUnblockedLink(sidUrl, logs, waitMs = 0) {
   logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
   const jar = new SimpleCookieJar();
@@ -315,7 +301,6 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     let html2 = step1.html;
     let currentUrl = step1.url;
 
-    // Bridge check: server may return a meta refresh / JS redirect instead of using this page directly
     let bridgeMatch = getMatch(html2, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[0-9]+;\s*url=([^"']+)["']?/i)
                    || getMatch(html2, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
 
@@ -330,7 +315,6 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     }
 
     logs.push(`[SID] Landed on verification page: ${currentUrl}`);
-    logs.push(`[SID] Step 1 cookies: ${jar.describe()}`);
 
     let wp_http2 = getMatch(html2, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i)
                  || getMatch(html2, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
@@ -353,20 +337,11 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     }, jar, currentUrl);
 
     const scriptContent = step2.html;
-    logs.push(`[SID] Step 2 cookies: ${jar.describe()}`);
 
-    // Step 3: Extract dynamic cookie (s_343) and dynamic link (c.setAttribute("href", ...))
     const cookieMatch = scriptContent.match(/s_343\('([^']+)',\s*'([^']+)'/);
-    const linkMatch = scriptContent.match(/c\.setAttribute\("href",\s*"([^"]+)"\)/)
+    let linkMatchVal = getMatch(scriptContent, /c\.setAttribute\("href",\s*"([^"]+)"\)/)
                     || getMatch(scriptContent, /href=["']([^"']*\?go=[^"']+)["']/i)
                     || getMatch(scriptContent, /window\.open\(['"]([^'"]*\?go=[^'"]+)['"]/);
-
-    let dynamicLinkPath = null;
-    if (linkMatch) {
-      dynamicLinkPath = Array.isArray(linkMatch) && linkMatch.length > 1 && typeof linkMatch[1] === 'string'
-        ? linkMatch[1]
-        : linkMatch;
-    }
 
     if (cookieMatch) {
       const cookieName = cookieMatch[1].trim();
@@ -375,20 +350,20 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
       logs.push(`[SID] Set dynamic cookie: ${cookieName}`);
     }
 
-    if (!dynamicLinkPath) {
+    if (!linkMatchVal) {
       logs.push(`[SID] ✗ No dynamic link found in step 2 response. Snippet: ${scriptContent.replace(/\s+/g, ' ').substring(0, 180)}`);
       return null;
     }
 
-    const goUrl = new URL(dynamicLinkPath, step2.url).href;
+    const goUrl = new URL(linkMatchVal, step2.url).href;
     logs.push(`[SID] Final ?go URL: ${goUrl}`);
-    logs.push(`[SID] Cookies before final hop: ${jar.describe()}`);
-    logs.push(`[SID] Waiting exactly 10s...`);
 
-    // Anti-bot velocity trap: wait before hitting ?go
-    await new Promise(r => setTimeout(r, 10000));
+    if (waitMs > 0) {
+      logs.push(`[SID] Waiting ${waitMs}ms before final hop...`);
+      await new Promise(r => setTimeout(r, waitMs));
+    }
 
-    // Step 4: Access ?go link, carrying the full jar + correct Referer (the page that generated the link)
+    // Step 3: Access ?go link
     let step3 = await jarFetch(goUrl, {
       method: 'GET',
       headers: { 'Upgrade-Insecure-Requests': '1' },
@@ -397,36 +372,30 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     let finalUrl = step3.url;
     let finalHtml = step3.html;
 
-    // If we're still parked on ?go, look for the real destination embedded in the response
     if (finalUrl === goUrl || finalUrl.includes('?go=')) {
       if (finalHtml.includes('Bad Request') || finalHtml.includes('Generate Link Again')) {
-        logs.push(`[SID] ✗ Target returned Bad Request on final hop.`);
-        logs.push(`[SID] Error Snippet: ${finalHtml.replace(/\s+/g, ' ').substring(0, 180)}`);
-        logs.push(`[SID] Cookies at failure: ${jar.describe()}`);
-        return null;
+        logs.push(`[SID] ✗ Target returned Bad Request on final hop (waitMs=${waitMs}).`);
+        return { badRequest: true };
       }
 
-      // Direct driveseed link embedded in body
       let dsMatch = finalHtml.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
       if (dsMatch) {
         logs.push(`[SID] Extracted DriveSeed from raw body directly.`);
         finalUrl = dsMatch[1];
       } else {
-        // meta refresh / JS redirect on the ?go page itself
         let goRedirect = getMatch(finalHtml, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[0-9]+;\s*url=([^"']+)["']?/i)
                        || getMatch(finalHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
 
         if (goRedirect) {
           const redirectUrl = new URL(goRedirect, goUrl).href;
           logs.push(`[SID] Following redirect from ?go page to: ${redirectUrl}`);
-          // Follow this final redirect WITH the jar, referer = the ?go page itself
           const step4 = await jarFetch(redirectUrl, { method: 'GET' }, jar, goUrl);
           finalUrl = step4.url;
           finalHtml = step4.html;
 
           if (finalUrl.includes('?go=') || finalHtml.includes('Bad Request') || finalHtml.includes('Generate Link Again')) {
-            logs.push(`[SID] ✗ Redirect target failed/looped. Snippet: ${finalHtml.replace(/\s+/g, ' ').substring(0, 180)}`);
-            return null;
+            logs.push(`[SID] ✗ Redirect target failed/looped.`);
+            return { badRequest: true };
           }
 
           dsMatch = finalHtml.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
@@ -449,6 +418,18 @@ async function resolveTechUnblockedLink(sidUrl, logs) {
     logs.push(`[SID] ✗ Exception: ${error.message}`);
     return null;
   }
+}
+
+// Wrapper that tries with no wait, then retries once with a short wait if a "Bad Request"
+// anti-bot response is hit. Avoids the old blanket 10s delay on every single request.
+async function resolveTechUnblockedLinkSmart(sidUrl, logs) {
+  let result = await resolveTechUnblockedLink(sidUrl, logs, 0);
+  if (result && result.badRequest) {
+    logs.push(`[SID] Retrying with ${SID_RETRY_WAIT_MS}ms wait...`);
+    result = await resolveTechUnblockedLink(sidUrl, logs, SID_RETRY_WAIT_MS);
+  }
+  if (result && result.badRequest) return null;
+  return result;
 }
 
 async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
@@ -520,7 +501,7 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
       const href = match[1];
       const text = stripTags(match[2]).toLowerCase();
 
-      if (href.includes('instant') || href.includes('video-seed')) {
+      if (href.includes('instant') || href.includes('video-seed') || href.includes('video-gen')) {
         if (text.includes('instant')) downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
       } else if (href.includes('resume')) {
         downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
@@ -541,6 +522,83 @@ async function resolveDriveseedLink(driveseedUrl, logs) {
   }
 }
 
+// ================================================================================
+// Final hop resolution: Instant Download links resolve to an intermediate host
+// (e.g. instant.video-gen.xyz/<token>::<id>) which redirects to
+// https://video-seed.dev/?url=<encoded gdrive url> (or similar *.dev/*.xyz host).
+// We follow that redirect and extract the `url` query parameter directly,
+// returning the raw googleusercontent.com link as the final playable URL.
+// ================================================================================
+async function resolveFinalVideoUrl(instantUrl, logs) {
+  try {
+    logs.push(`[Final] Resolving instant link: ${instantUrl}`);
+
+    let response = await fetch(instantUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { 'User-Agent': USER_AGENT },
+    });
+
+    let location = response.headers.get('location');
+    let finalUrl = instantUrl;
+
+    let hops = 0;
+    let currentUrl = instantUrl;
+    while (location && hops < 5) {
+      const resolvedLocation = new URL(location, currentUrl).href;
+      logs.push(`[Final] Redirect ${hops + 1}: ${resolvedLocation}`);
+
+      try {
+        const u = new URL(resolvedLocation);
+        const embeddedUrl = u.searchParams.get('url');
+        if (embeddedUrl && embeddedUrl.includes('googleusercontent.com')) {
+          const decoded = decodeURIComponent(embeddedUrl);
+          logs.push(`[Final] ✓ Extracted Google Drive URL from redirect param.`);
+          return decoded;
+        }
+      } catch (_) { /* not a valid URL with searchParams, continue */ }
+
+      currentUrl = resolvedLocation;
+      response = await fetch(currentUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { 'User-Agent': USER_AGENT, 'Referer': instantUrl },
+      });
+      location = response.headers.get('location');
+      finalUrl = currentUrl;
+      hops++;
+    }
+
+    try {
+      const u = new URL(finalUrl);
+      const embeddedUrl = u.searchParams.get('url');
+      if (embeddedUrl && embeddedUrl.includes('googleusercontent.com')) {
+        const decoded = decodeURIComponent(embeddedUrl);
+        logs.push(`[Final] ✓ Extracted Google Drive URL from final URL param.`);
+        return decoded;
+      }
+    } catch (_) {}
+
+    try {
+      const bodyRes = await fetchWithRetry(finalUrl, { headers: { 'Referer': instantUrl } });
+      const html = await bodyRes.text();
+      const gMatch = html.match(/https?:\/\/[^\s'"]*googleusercontent\.com[^\s'"]*/i);
+      if (gMatch) {
+        logs.push(`[Final] ✓ Extracted Google Drive URL from page body.`);
+        return gMatch[0];
+      }
+    } catch (e) {
+      logs.push(`[Final] Body scan failed: ${e.message}`);
+    }
+
+    logs.push(`[Final] ✗ Could not extract Google Drive URL. Returning intermediate URL.`);
+    return finalUrl;
+  } catch (error) {
+    logs.push(`[Final] ✗ Exception: ${error.message}`);
+    return instantUrl;
+  }
+}
+
 async function extractAllDownloadableLinks(moviePageUrl) {
   const logs = [];
   logs.push(`[Main] Getting all downloadable links from: ${moviePageUrl}`);
@@ -548,10 +606,18 @@ async function extractAllDownloadableLinks(moviePageUrl) {
     const downloadLinks = await extractDownloadLinks(moviePageUrl, logs);
     if (downloadLinks.length === 0) return { links: [], logs };
 
+    // Filter for target quality only (e.g. 1080p)
+    const targetLinks = downloadLinks.filter(l => l.quality.toLowerCase().includes(TARGET_QUALITY.toLowerCase()));
+    const linksToProcess = targetLinks.length > 0 ? targetLinks.slice(0, 1) : [];
+
+    if (linksToProcess.length === 0) {
+      logs.push(`[Main] ✗ No "${TARGET_QUALITY}" quality link found. Available: ${downloadLinks.map(l => l.quality).join(', ')}`);
+      return { links: [], logs };
+    }
+
     const allDownloadableLinks = [];
 
-    // LIMIT TO EXACTLY 1 QUALITY to guarantee completion
-    for (const link of downloadLinks.slice(0, 1)) {
+    for (const link of linksToProcess) {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
@@ -564,17 +630,23 @@ async function extractAllDownloadableLinks(moviePageUrl) {
             let currentUrl = targetLink.url;
 
             if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
-              const resolvedSid = await resolveTechUnblockedLink(currentUrl, logs);
+              const resolvedSid = await resolveTechUnblockedLinkSmart(currentUrl, logs);
               if (resolvedSid) currentUrl = resolvedSid;
             }
 
             if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
               const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logs);
               for (const option of downloadOptions) {
-                allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: option.title, url: option.url, size, fileName });
+                let finalUrl = option.url;
+
+                // Resolve Instant Download links through to the final googleusercontent URL
+                if (option.type === 'instant') {
+                  finalUrl = await resolveFinalVideoUrl(option.url, logs);
+                }
+
+                allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: option.title, url: finalUrl, size, fileName });
               }
             } else {
-              // Valid catch if it failed to bypass or was a direct link
               if (!currentUrl.includes('?go=')) {
                   allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: 'Direct Link', url: currentUrl });
               }
@@ -606,70 +678,278 @@ async function handleRequest(request) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MoviesMod Enhanced Scraper</title>
+  <title>MoviesMod Extractor</title>
   <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #171a23;
+      --panel-2: #1d2230;
+      --border: #2a2f3f;
+      --accent: #7c8cff;
+      --accent-2: #9b6cff;
+      --text: #e6e8f0;
+      --muted: #8b93a7;
+      --good: #4ade80;
+      --bad: #f87171;
+      --warn: #fbbf24;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
-    .container { background: white; border-radius: 12px; padding: 40px; max-width: 1200px; margin: 0 auto; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3); }
-    h1 { color: #333; margin-bottom: 10px; text-align: center; }
-    .subtitle { color: #666; text-align: center; margin-bottom: 30px; font-size: 14px; }
-    .search-box { display: flex; gap: 10px; margin-bottom: 30px; }
-    input { flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; }
-    button { padding: 12px 30px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; }
-    .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 30px; }
-    @media (max-width: 768px) { .two-column { grid-template-columns: 1fr; } }
-    .section { background: #f9f9f9; padding: 20px; border-radius: 8px; border: 1px solid #e0e0e0; }
-    .section-title { font-weight: 600; color: #667eea; margin-bottom: 15px; font-size: 14px; text-transform: uppercase; }
-    .result-item { background: white; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #667eea; word-break: break-word; }
-    .result-title { font-weight: 600; color: #333; margin-bottom: 6px; font-size: 13px; }
-    .result-url { font-size: 11px; color: #666; font-family: monospace; background: #f0f0f0; padding: 6px; border-radius: 4px; margin-bottom: 6px; display: block; overflow-x: auto; }
-    .copy-btn { font-size: 10px; padding: 4px 12px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer; }
-    .loading { text-align: center; color: #666; padding: 20px; }
-    .error { background: #fee; color: #c33; padding: 15px; border-radius: 8px; border-left: 4px solid #c33; margin-top: 20px; }
-    .empty { text-align: center; color: #999; padding: 30px 20px; font-size: 14px; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: radial-gradient(circle at top left, #1a1d2b 0%, var(--bg) 60%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .container { max-width: 1100px; margin: 0 auto; }
+    header { text-align: center; margin-bottom: 28px; }
+    header h1 {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    header p { color: var(--muted); margin-top: 6px; font-size: 13px; }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(124, 140, 255, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(124, 140, 255, 0.3);
+      margin-top: 8px;
+    }
+    .search-box {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 24px;
+      background: var(--panel);
+      padding: 8px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+    }
+    input {
+      flex: 1;
+      padding: 12px 16px;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      background: var(--panel-2);
+      color: var(--text);
+      outline: none;
+    }
+    input::placeholder { color: var(--muted); }
+    input:focus { box-shadow: 0 0 0 2px var(--accent); }
+    button.search-btn {
+      padding: 12px 26px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 14px;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    button.search-btn:hover { opacity: 0.9; }
+    button.search-btn:active { transform: scale(0.98); }
+    button.search-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+    .panel-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .result-item {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .result-title { font-weight: 600; font-size: 13.5px; margin-bottom: 8px; line-height: 1.4; }
+    .result-meta { font-size: 12px; color: var(--muted); margin-bottom: 6px; line-height: 1.5; }
+    .result-url {
+      font-size: 11.5px;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', 'SF Mono', monospace;
+      background: rgba(0,0,0,0.25);
+      padding: 8px 10px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      display: block;
+      overflow-x: auto;
+      white-space: nowrap;
+      border: 1px solid var(--border);
+    }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill-btn {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 14px;
+      background: rgba(124, 140, 255, 0.12);
+      color: var(--accent);
+      border: 1px solid rgba(124, 140, 255, 0.3);
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .pill-btn:hover { background: rgba(124, 140, 255, 0.22); }
+    .pill-btn.primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff;
+      border: none;
+    }
+    .quality-tag {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 6px;
+      background: rgba(155, 108, 255, 0.18);
+      color: var(--accent-2);
+      border: 1px solid rgba(155, 108, 255, 0.35);
+      margin-bottom: 8px;
+    }
+
+    .loading {
+      text-align: center;
+      color: var(--muted);
+      padding: 30px 10px;
+      font-size: 13px;
+    }
+    .spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error {
+      background: rgba(248, 113, 113, 0.1);
+      color: var(--bad);
+      padding: 14px 16px;
+      border-radius: 10px;
+      border: 1px solid rgba(248, 113, 113, 0.3);
+      margin-bottom: 18px;
+      font-size: 13px;
+    }
+    .empty { text-align: center; color: var(--muted); padding: 30px 10px; font-size: 13px; }
+
+    .debug-panel { margin-top: 18px; }
+    .debug-log {
+      font-family: 'JetBrains Mono', 'SF Mono', monospace;
+      font-size: 11.5px;
+      background: rgba(0,0,0,0.3);
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      max-height: 320px;
+      overflow-y: auto;
+      line-height: 1.7;
+      color: var(--muted);
+    }
+    .debug-log div { padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.03); white-space: pre-wrap; word-break: break-all; }
+    .log-err { color: var(--bad); }
+    .log-ok { color: var(--good); }
+    .log-warn { color: var(--warn); }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 20px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 13px;
+      opacity: 0;
+      transition: opacity 0.2s, transform 0.2s;
+      pointer-events: none;
+      z-index: 100;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (Targeted Quality + Anti-Bot Bypass)</p>
+    <header>
+      <h1>🎬 MoviesMod Extractor</h1>
+      <p>Search &amp; resolve direct streaming links with anti-bot bypass</p>
+      <div class="badge">Target quality: ${TARGET_QUALITY}</div>
+    </header>
 
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
-      <button onclick="search()">Search</button>
+      <button class="search-btn" id="searchBtn" onclick="search()">Search</button>
     </div>
 
-    <div id="alert" class="error" style="display: none;"></div>
+    <div id="alert"></div>
 
-    <div class="two-column">
-      <div class="section">
-        <div class="section-title">📽️ Movie Pages</div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">📽️ Movie Pages</div>
         <div id="pageResults" class="empty">Search to see results</div>
       </div>
 
-      <div class="section">
-        <div class="section-title">🔗 Download Links</div>
+      <div class="panel">
+        <div class="panel-title">🔗 Final Links</div>
         <div id="downloadResults" class="empty">Links appear here</div>
       </div>
     </div>
 
-    <div class="section" style="margin-top: 20px;">
-      <div class="section-title">🐛 Debug Logs</div>
-      <div id="debugLogs" style="font-family: monospace; font-size: 12px; background: #fff; padding: 15px; border-radius: 8px; border: 1px solid #e0e0e0; max-height: 400px; overflow-y: auto; color: #444; line-height: 1.5;">
-        Awaiting action...
-      </div>
+    <div class="panel debug-panel">
+      <div class="panel-title">🐛 Debug Logs</div>
+      <div id="debugLogs" class="debug-log">Awaiting action...</div>
     </div>
   </div>
+
+  <div class="toast" id="toast">Copied to clipboard!</div>
 
   <script>
     async function search() {
       const query = document.getElementById('searchInput').value.trim();
       if (!query) return;
 
-      document.getElementById('alert').style.display = 'none';
-      document.getElementById('pageResults').innerHTML = '<div class="loading">Searching movies...</div>';
-      document.getElementById('downloadResults').innerHTML = '';
-      document.getElementById('debugLogs').innerHTML = '<div class="loading">Awaiting trace logs...</div>';
+      const btn = document.getElementById('searchBtn');
+      btn.disabled = true;
+      btn.textContent = 'Searching...';
+
+      document.getElementById('alert').innerHTML = '';
+      document.getElementById('pageResults').innerHTML = '<div class="loading"><span class="spinner"></span>Searching movies...</div>';
+      document.getElementById('downloadResults').innerHTML = '<div class="empty">Links appear here</div>';
+      document.getElementById('debugLogs').innerHTML = 'Awaiting trace logs...';
 
       try {
         const pageResponse = await fetch(\`/search-api?q=\${encodeURIComponent(query)}\`);
@@ -684,11 +964,13 @@ async function handleRequest(request) {
           <div class="result-item">
             <div class="result-title">\${i + 1}. \${r.title}</div>
             <span class="result-url">\${r.url}</span>
-            <button class="copy-btn" onclick="copyText('\${r.url}')">Copy URL</button>
+            <div class="actions">
+              <button class="pill-btn" onclick="copyText('\${r.url}')">Copy URL</button>
+            </div>
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Bypassing Safelink (takes 10-15 seconds)...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading"><span class="spinner"></span>Bypassing safelink &amp; resolving final link...</div>';
 
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
@@ -697,9 +979,13 @@ async function handleRequest(request) {
         if (linksData.logs) {
           document.getElementById('debugLogs').innerHTML = linksData.logs.map(log => {
              const isErr = log.includes('✗');
-             const isPass = log.includes('✓') || log.includes('⚠️');
-             const color = isErr ? '#c33' : isPass ? '#2a9d8f' : '#444';
-             return \`<div style="color: \${color}; border-bottom: 1px solid #eee; padding-bottom: 2px; margin-bottom: 4px;">\${log}</div>\`;
+             const isPass = log.includes('✓');
+             const isWarn = log.includes('⚠️');
+             let cls = '';
+             if (isErr) cls = 'log-err';
+             else if (isPass) cls = 'log-ok';
+             else if (isWarn) cls = 'log-warn';
+             return \`<div class="\${cls}">\${log}</div>\`;
           }).join('');
         }
 
@@ -716,30 +1002,37 @@ async function handleRequest(request) {
 
         let html = '';
         Object.keys(grouped).forEach(quality => {
-          html += \`<div style="margin-bottom: 15px;"><div class="result-title">\${quality}</div>\`;
+          html += \`<div class="quality-tag">\${quality}</div>\`;
           grouped[quality].forEach(link => {
-            html += \`<div style="margin-left: 10px; margin-bottom: 8px;">
-              <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
-                📌 \${link.method}\${link.server ? ' • ' + link.server : ''}\${link.fileName ? '<br/>📁 ' + link.fileName : ''}\${link.size ? '<br/>📊 ' + link.size : ''}
+            html += \`<div class="result-item">
+              <div class="result-meta">
+                📌 \${link.method}\${link.server ? ' • ' + link.server : ''}
+                \${link.fileName ? '<br/>📁 ' + link.fileName : ''}
+                \${link.size ? '<br/>📊 ' + link.size : ''}
               </div>
               <span class="result-url">\${link.url}</span>
-              <button class="copy-btn" onclick="window.open('\${link.url}', '_blank')">Open</button>
-              <button class="copy-btn" onclick="copyText('\${link.url}')">Copy</button>
+              <div class="actions">
+                <button class="pill-btn primary" onclick="window.open('\${link.url}', '_blank')">Open</button>
+                <button class="pill-btn" onclick="copyText('\${link.url}')">Copy</button>
+              </div>
             </div>\`;
           });
-          html += '</div>';
         });
 
         document.getElementById('downloadResults').innerHTML = html;
       } catch (error) {
-        document.getElementById('alert').textContent = \`Error: \${error.message}\`;
-        document.getElementById('alert').style.display = 'block';
+        document.getElementById('alert').innerHTML = \`<div class="error">Error: \${error.message}</div>\`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Search';
       }
     }
 
     function copyText(text) {
       navigator.clipboard.writeText(text);
-      alert('Copied to clipboard!');
+      const toast = document.getElementById('toast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 1500);
     }
   </script>
 </body>
