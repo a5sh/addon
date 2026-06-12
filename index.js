@@ -1,6 +1,6 @@
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.4.1',
+  version: '0.4.2',
   name: 'MoviesMod',
   description: 'Extracts HTTP streams from MoviesMod (Custom Cookie Engine & Sub-page Referer)',
   types: ['movie', 'series'],
@@ -52,45 +52,40 @@ async function fetchWithRetry(url, options = {}, retries = 1) {
   }
 }
 
-// Custom Fetch Engine: Manually catches 302 redirects to hoard cookies into a virtual session map
-async function fetchWithCookies(url, options = {}, cookieMap = new Map()) {
-  let currentUrl = url;
-  let maxRedirects = 5;
-  let html = '';
-  let finalRes = null;
+// ================================================================================
+// Real Cookie Jar (replaces the old fake/pre-seeded cookieMap approach)
+// ================================================================================
+// The old implementation pre-seeded random PHPSESSID/cf_clearance values and
+// manually replayed Set-Cookie headers across hops. This broke the anti-bot
+// continuity check on the final ?go= endpoint ("Bad Request... Enable Cookies").
+// Nuvio's resolveTechUnblockedLink avoids this entirely by using a real cookie
+// jar (tough-cookie via axios-cookiejar-support) so cookies set at each hop are
+// stored and replayed exactly as a browser would. We replicate that behavior
+// here with a minimal jar implementation on top of fetch.
 
-  while (maxRedirects > 0) {
-    const headers = new Headers(options.headers || {});
-    
-    // Pre-seed session to bypass aggressive empty-cookie drops
-    if (cookieMap.size === 0) {
-      cookieMap.set('PHPSESSID', Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
-      cookieMap.set('cf_clearance', Math.random().toString(36).substring(2, 15));
-    }
+class SimpleCookieJar {
+  constructor() {
+    // key: domain -> Map(cookieName -> cookieValue)
+    this.store = new Map();
+  }
 
-    headers.set('Cookie', Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; '));
-    headers.set('User-Agent', USER_AGENT);
+  _domainKey(url) {
+    return new URL(url).hostname;
+  }
 
-    const res = await fetch(currentUrl, {
-      method: options.method || 'GET',
-      headers,
-      body: options.body,
-      redirect: 'manual', // Prevent native fetch from dropping Set-Cookie headers on 302 hops
-      cache: 'no-store'
-    });
-
-    finalRes = res;
-    html = await res.text();
-
-    // 1. Extract Headers Cookies
+  setFromResponse(response, url) {
     let setCookies = [];
-    if (typeof res.headers.getSetCookie === 'function') {
-      setCookies = res.headers.getSetCookie();
+    if (typeof response.headers.getSetCookie === 'function') {
+      setCookies = response.headers.getSetCookie();
     } else {
-      const sc = res.headers.get('set-cookie');
+      const sc = response.headers.get('set-cookie');
       if (sc) setCookies = sc.split(/,(?=\s*[A-Za-z0-9_-]+\s*=)/);
     }
-    
+
+    const domain = this._domainKey(url);
+    if (!this.store.has(domain)) this.store.set(domain, new Map());
+    const domainCookies = this.store.get(domain);
+
     for (const c of setCookies) {
       if (!c) continue;
       const pair = c.split(';')[0].trim();
@@ -98,13 +93,17 @@ async function fetchWithCookies(url, options = {}, cookieMap = new Map()) {
       if (splitIndex !== -1) {
         const k = pair.substring(0, splitIndex).trim();
         const v = pair.substring(splitIndex + 1).trim();
-        if (k && !['path', 'expires', 'domain', 'httponly', 'secure', 'samesite', 'max-age'].includes(k.toLowerCase())) {
-          cookieMap.set(k, v);
-        }
+        if (k) domainCookies.set(k, v);
       }
     }
+  }
 
-    // 2. Extract Javascript Inline Cookies
+  // Extract document.cookie = "..." assignments from inline scripts and store them
+  setFromHtml(html, url) {
+    const domain = this._domainKey(url);
+    if (!this.store.has(domain)) this.store.set(domain, new Map());
+    const domainCookies = this.store.get(domain);
+
     const jsRegex = /document\.cookie\s*=\s*(['"`])([^`'"]+)\1/gi;
     let match;
     while ((match = jsRegex.exec(html)) !== null) {
@@ -113,34 +112,89 @@ async function fetchWithCookies(url, options = {}, cookieMap = new Map()) {
       if (splitIndex !== -1) {
         const k = pair.substring(0, splitIndex).trim();
         const v = pair.substring(splitIndex + 1).trim();
-        if (k) cookieMap.set(k, v);
+        if (k) domainCookies.set(k, v);
       }
     }
+  }
 
-    // 3. Follow Redirect Manually
+  setCookie(name, value, url) {
+    const domain = this._domainKey(url);
+    if (!this.store.has(domain)) this.store.set(domain, new Map());
+    this.store.get(domain).set(name, value);
+  }
+
+  getCookieHeader(url) {
+    const domain = this._domainKey(url);
+    const domainCookies = this.store.get(domain);
+    if (!domainCookies || domainCookies.size === 0) return '';
+    return Array.from(domainCookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+
+  describe() {
+    const parts = [];
+    for (const [domain, cookies] of this.store.entries()) {
+      parts.push(`${domain}: ${Array.from(cookies.keys()).join(', ')}`);
+    }
+    return parts.join(' | ');
+  }
+}
+
+// Fetch through the jar: attaches Cookie header from jar, stores Set-Cookie + JS cookies back into jar.
+// Follows redirects manually (redirect: 'manual') so Set-Cookie headers on 302s aren't dropped,
+// and so we can carry Referer correctly across hops like a browser would.
+async function jarFetch(url, options = {}, jar, refererOverride = null) {
+  let currentUrl = url;
+  let currentReferer = refererOverride;
+  let maxRedirects = 5;
+  let html = '';
+  let finalRes = null;
+  let finalUrl = url;
+
+  while (maxRedirects > 0) {
+    const headers = new Headers(options.headers || {});
+    headers.set('User-Agent', USER_AGENT);
+
+    const cookieHeader = jar.getCookieHeader(currentUrl);
+    if (cookieHeader) headers.set('Cookie', cookieHeader);
+    if (currentReferer) headers.set('Referer', currentReferer);
+
+    const res = await fetch(currentUrl, {
+      method: options.method || 'GET',
+      headers,
+      body: options.body,
+      redirect: 'manual',
+      cache: 'no-store',
+    });
+
+    finalRes = res;
+    html = await res.text();
+    finalUrl = currentUrl;
+
+    jar.setFromResponse(res, currentUrl);
+    jar.setFromHtml(html, currentUrl);
+
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       let location = res.headers.get('location');
       if (location) {
         if (location.startsWith('/')) location = new URL(location, currentUrl).href;
-        else location = new URL(location).href;
-        
+        else location = new URL(location, currentUrl).href;
+
+        let nextOptions = { ...options };
         if (res.status === 302 || res.status === 303) {
-          options.method = 'GET';
-          delete options.body;
-          if (options.headers) delete options.headers['Content-Type'];
+          nextOptions.method = 'GET';
+          delete nextOptions.body;
         }
-        
-        if (!options.headers) options.headers = {};
-        options.headers['Referer'] = currentUrl;
-        
+
+        currentReferer = currentUrl;
         currentUrl = location;
+        options = nextOptions;
         maxRedirects--;
         continue;
       }
     }
     break;
   }
-  return { response: finalRes, url: currentUrl, html, cookieMap };
+  return { response: finalRes, url: finalUrl, html, jar };
 }
 
 async function searchMoviesMod(query) {
@@ -157,7 +211,7 @@ async function searchMoviesMod(query) {
 
     while ((articleMatch = articleRegex.exec(html)) !== null) {
       const articleHtml = articleMatch[1];
-      const linkMatch = articleHtml.match(/<a[^>]+href=["']([^"']+)["'][^>]*title=["']([^"']+)["']/i) 
+      const linkMatch = articleHtml.match(/<a[^>]+href=["']([^"']+)["'][^>]*title=["']([^"']+)["']/i)
                      || articleHtml.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
 
       if (linkMatch) {
@@ -187,12 +241,12 @@ async function extractDownloadLinks(moviePageUrl, logs) {
     if (!contentMatch) return links;
 
     const blocks = contentMatch[1].split(/(?=<h[2-6])/i);
-    
+
     for (const block of blocks) {
       const headerMatch = block.match(/<h[2-6][^>]*>([\s\S]*?)<\/h[2-6]>/i);
       const rawHeader = stripTags(headerMatch ? headerMatch[1] : 'Unknown Quality');
       const qualityMatch = rawHeader.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
-      
+
       let quality = rawHeader;
       if (quality.length > 100 || !qualityMatch) {
         quality = '';
@@ -203,7 +257,7 @@ async function extractDownloadLinks(moviePageUrl, logs) {
 
       const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
       let linkMatch;
-      
+
       while ((linkMatch = linkRegex.exec(block)) !== null) {
         const url = linkMatch[1];
         if (url && (url.includes('modpro') || url.includes('links'))) {
@@ -218,124 +272,178 @@ async function extractDownloadLinks(moviePageUrl, logs) {
   }
 }
 
-// Complete Safelink Bypass resolving Sub-Page Redirections and strict Referers
+// ================================================================================
+// SID Resolution (rewritten to follow Nuvio's flow with a real cookie jar)
+// ================================================================================
+// Steps mirror addon resolveTechUnblockedLink / resolveSidToRedirect:
+//  0. GET sidUrl -> form#landing with _wp_http + action
+//  1. POST action with _wp_http -> verification page with form#landing (_wp_http2 + token)
+//  2. POST verification action with _wp_http2 + token -> page containing JS that sets
+//     a dynamic cookie (s_343('name','value')) and a link (c.setAttribute("href","..."))
+//  3. Set that cookie in the jar, then GET the dynamic link with correct Referer
+//  4. Read the resulting ?go= link (or meta refresh / window.location) and follow it
+//     with the jar attached -- this is the step that previously failed with
+//     "Bad Request" because cookies weren't continuous.
 async function resolveTechUnblockedLink(sidUrl, logs) {
   logs.push(`[SID] Resolving payload for: ${sidUrl}`);
   const { origin } = new URL(sidUrl);
-  const cookieMap = new Map();
+  const jar = new SimpleCookieJar();
 
   try {
-    // Step 1: Initial Load (Follows any HTTP 302 to root automatically)
-    let step1 = await fetchWithCookies(sidUrl, { method: 'GET' }, cookieMap);
-    let wp_http = getMatch(step1.html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i) || getMatch(step1.html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
-    let action1 = getMatch(step1.html, /<form[^>]+action=["']([^"']+)["']/i) || step1.url;
-    
+    // Step 0: Initial Load
+    let step0 = await jarFetch(sidUrl, { method: 'GET' }, jar);
+
+    let wp_http = getMatch(step0.html, /name=["']_wp_http["']\s+value=["']([^"']+)["']/i)
+                || getMatch(step0.html, /value=["']([^"']+)["']\s+name=["']_wp_http["']/i);
+    let action0 = getMatch(step0.html, /<form[^>]+action=["']([^"']+)["']/i) || step0.url;
+
     if (!wp_http) {
-      logs.push(`[SID] ✗ Missing initial token. Snippet: ${step1.html.replace(/\s+/g, ' ').substring(0, 150)}`);
+      logs.push(`[SID] ✗ Missing initial token (_wp_http). Snippet: ${step0.html.replace(/\s+/g, ' ').substring(0, 150)}`);
       return null;
     }
 
-    const action1Url = new URL(action1, step1.url).href;
+    const action0Url = new URL(action0, step0.url).href;
+    logs.push(`[SID] Step 0 OK. Cookies: ${jar.describe()}`);
 
-    // Step 2: POST to root
-    let step2 = await fetchWithCookies(action1Url, {
+    // Step 1: POST _wp_http to action0
+    let step1 = await jarFetch(action0Url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': step1.url },
-      body: new URLSearchParams({ '_wp_http': wp_http }).toString()
-    }, cookieMap);
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ '_wp_http': wp_http }).toString(),
+    }, jar, sidUrl);
 
-    let currentUrl = step2.url;
-    let html2 = step2.html;
+    let html2 = step1.html;
+    let currentUrl = step1.url;
 
-    // Bridge checking: The server often returns an HTML page with a <meta> refresh or JS window.location instead of a 302
-    let subpageUrlMatch = getMatch(html2, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[0-9]+;\s*url=([^"']+)["']?/i) || 
-                          getMatch(html2, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
+    // Bridge check: server may return a meta refresh / JS redirect instead of using this page directly
+    let bridgeMatch = getMatch(html2, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[0-9]+;\s*url=([^"']+)["']?/i)
+                   || getMatch(html2, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
 
-    if (subpageUrlMatch) {
-      let subpageUrl = new URL(subpageUrlMatch, currentUrl).href;
-      if (subpageUrl !== currentUrl) {
-        logs.push(`[SID] Following HTML/JS redirect to Sub-Page: ${subpageUrl}`);
-        let step2_5 = await fetchWithCookies(subpageUrl, { method: 'GET', headers: { 'Referer': currentUrl } }, cookieMap);
-        currentUrl = step2_5.url;
-        html2 = step2_5.html;
+    if (bridgeMatch) {
+      const bridgeUrl = new URL(bridgeMatch, currentUrl).href;
+      if (bridgeUrl !== currentUrl) {
+        logs.push(`[SID] Following bridge redirect to: ${bridgeUrl}`);
+        const stepBridge = await jarFetch(bridgeUrl, { method: 'GET' }, jar, currentUrl);
+        currentUrl = stepBridge.url;
+        html2 = stepBridge.html;
       }
     }
 
-    logs.push(`[SID] Landed on Sub-Page: ${currentUrl}`);
+    logs.push(`[SID] Landed on verification page: ${currentUrl}`);
+    logs.push(`[SID] Step 1 cookies: ${jar.describe()}`);
 
-    let wp_http2 = getMatch(html2, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i) || getMatch(html2, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
-    let token = getMatch(html2, /name=["']token["']\s+value=["']([^"']+)["']/i) || getMatch(html2, /value=["']([^"']+)["']\s+name=["']token["']/i);
-    let action2 = getMatch(html2, /<form[^>]+action=["']([^"']+)["']/i) || currentUrl;
+    let wp_http2 = getMatch(html2, /name=["']_wp_http2["']\s+value=["']([^"']+)["']/i)
+                 || getMatch(html2, /value=["']([^"']+)["']\s+name=["']_wp_http2["']/i);
+    let token = getMatch(html2, /name=["']token["']\s+value=["']([^"']+)["']/i)
+              || getMatch(html2, /value=["']([^"']+)["']\s+name=["']token["']/i);
+    let action1 = getMatch(html2, /<form[^>]+action=["']([^"']+)["']/i) || currentUrl;
 
     if (!wp_http2) {
-      logs.push(`[SID] ✗ Missing secondary tokens on Sub-Page. Snippet: ${html2.replace(/\s+/g, ' ').substring(0, 150)}`);
+      logs.push(`[SID] ✗ Missing secondary token (_wp_http2). Snippet: ${html2.replace(/\s+/g, ' ').substring(0, 150)}`);
       return null;
     }
 
-    const action2Url = new URL(action2, currentUrl).href;
+    const action1Url = new URL(action1, currentUrl).href;
 
-    // Step 3: POST tokens from exact sub-page
-    let step3 = await fetchWithCookies(action2Url, {
+    // Step 2: POST _wp_http2 + token
+    let step2 = await jarFetch(action1Url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': currentUrl },
-      body: new URLSearchParams({ '_wp_http2': wp_http2, token: token || '' }).toString()
-    }, cookieMap);
-    
-    let matchUrl = getMatch(step3.html, /href=["']([^"']*\?go=[^"']+)["']/i) || 
-                   getMatch(step3.html, /window\.open\(['"]([^'"]*\?go=[^'"]+)['"]/i) || 
-                   getMatch(step3.html, /setAttribute\("href",\s*"([^"]+)"\)/) || 
-                   getMatch(step3.html, /window\.location\.replace\("([^"]+)"\)/);
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ '_wp_http2': wp_http2, token: token || '' }).toString(),
+    }, jar, currentUrl);
 
-    if (!matchUrl) {
-       logs.push(`[SID] ✗ No jump link generated in payload. Snippet: ${step3.html.replace(/\s+/g, ' ').substring(0, 150)}`);
-       return null;
+    const scriptContent = step2.html;
+    logs.push(`[SID] Step 2 cookies: ${jar.describe()}`);
+
+    // Step 3: Extract dynamic cookie (s_343) and dynamic link (c.setAttribute("href", ...))
+    const cookieMatch = scriptContent.match(/s_343\('([^']+)',\s*'([^']+)'/);
+    const linkMatch = scriptContent.match(/c\.setAttribute\("href",\s*"([^"]+)"\)/)
+                    || getMatch(scriptContent, /href=["']([^"']*\?go=[^"']+)["']/i)
+                    || getMatch(scriptContent, /window\.open\(['"]([^'"]*\?go=[^'"]+)['"]/);
+
+    let dynamicLinkPath = null;
+    if (linkMatch) {
+      dynamicLinkPath = Array.isArray(linkMatch) && linkMatch.length > 1 && typeof linkMatch[1] === 'string'
+        ? linkMatch[1]
+        : linkMatch;
     }
-    
-    const goUrl = new URL(matchUrl, step3.url).href;
+
+    if (cookieMatch) {
+      const cookieName = cookieMatch[1].trim();
+      const cookieValue = cookieMatch[2].trim();
+      jar.setCookie(cookieName, cookieValue, origin);
+      logs.push(`[SID] Set dynamic cookie: ${cookieName}`);
+    }
+
+    if (!dynamicLinkPath) {
+      logs.push(`[SID] ✗ No dynamic link found in step 2 response. Snippet: ${scriptContent.replace(/\s+/g, ' ').substring(0, 180)}`);
+      return null;
+    }
+
+    const goUrl = new URL(dynamicLinkPath, step2.url).href;
     logs.push(`[SID] Final ?go URL: ${goUrl}`);
-    logs.push(`[Cookies] Mapped: ${Array.from(cookieMap.keys()).join(', ')}`);
+    logs.push(`[SID] Cookies before final hop: ${jar.describe()}`);
     logs.push(`[SID] Waiting exactly 10s...`);
 
-    // Force 10s delay to completely bypass the backend "Double Click" velocity anti-bot trap
+    // Anti-bot velocity trap: wait before hitting ?go
     await new Promise(r => setTimeout(r, 10000));
 
-    // Step 4: Access ?go link FROM the exact sub-page Reference
-    let step4 = await fetchWithCookies(goUrl, {
+    // Step 4: Access ?go link, carrying the full jar + correct Referer (the page that generated the link)
+    let step3 = await jarFetch(goUrl, {
       method: 'GET',
-      headers: { 'Referer': step3.url, 'Upgrade-Insecure-Requests': '1' }
-    }, cookieMap);
+      headers: { 'Upgrade-Insecure-Requests': '1' },
+    }, jar, step2.url);
 
-    let finalUrl = step4.url;
+    let finalUrl = step3.url;
+    let finalHtml = step3.html;
 
-    // Validate that finalUrl moved off the ?go endpoint. If it didn't, parse error state.
+    // If we're still parked on ?go, look for the real destination embedded in the response
     if (finalUrl === goUrl || finalUrl.includes('?go=')) {
-      if (step4.html.includes("Bad Request") || step4.html.includes("Generate Link Again")) {
-        logs.push(`[SID] ✗ Target returned Bad Request.`);
-        logs.push(`[SID] Error Snippet: ${step4.html.replace(/\s+/g, ' ').substring(0, 180)}`);
+      if (finalHtml.includes('Bad Request') || finalHtml.includes('Generate Link Again')) {
+        logs.push(`[SID] ✗ Target returned Bad Request on final hop.`);
+        logs.push(`[SID] Error Snippet: ${finalHtml.replace(/\s+/g, ' ').substring(0, 180)}`);
+        logs.push(`[SID] Cookies at failure: ${jar.describe()}`);
         return null;
       }
-      
-      let dsMatch = step4.html.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
+
+      // Direct driveseed link embedded in body
+      let dsMatch = finalHtml.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
       if (dsMatch) {
-         logs.push(`[SID] Extracted DriveSeed from raw body directly.`);
-         finalUrl = dsMatch[1];
+        logs.push(`[SID] Extracted DriveSeed from raw body directly.`);
+        finalUrl = dsMatch[1];
       } else {
-         const jsRedirectMatch = getMatch(step4.html, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
-         if (jsRedirectMatch) {
-             finalUrl = new URL(jsRedirectMatch, goUrl).href;
-         } else {
-             logs.push(`[SID] ✗ Target failed to provide JS redirect. Snippet: ${step4.html.replace(/\s+/g, ' ').substring(0, 180)}`);
-             return null;
-         }
+        // meta refresh / JS redirect on the ?go page itself
+        let goRedirect = getMatch(finalHtml, /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[0-9]+;\s*url=([^"']+)["']?/i)
+                       || getMatch(finalHtml, /window\.location(?:\.replace|\.href)?\s*(?:\(\s*|=\s*)["']([^"']+)["']/i);
+
+        if (goRedirect) {
+          const redirectUrl = new URL(goRedirect, goUrl).href;
+          logs.push(`[SID] Following redirect from ?go page to: ${redirectUrl}`);
+          // Follow this final redirect WITH the jar, referer = the ?go page itself
+          const step4 = await jarFetch(redirectUrl, { method: 'GET' }, jar, goUrl);
+          finalUrl = step4.url;
+          finalHtml = step4.html;
+
+          if (finalUrl.includes('?go=') || finalHtml.includes('Bad Request') || finalHtml.includes('Generate Link Again')) {
+            logs.push(`[SID] ✗ Redirect target failed/looped. Snippet: ${finalHtml.replace(/\s+/g, ' ').substring(0, 180)}`);
+            return null;
+          }
+
+          dsMatch = finalHtml.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
+          if (dsMatch) finalUrl = dsMatch[1];
+        } else {
+          logs.push(`[SID] ✗ ?go page produced no recognizable redirect. Snippet: ${finalHtml.replace(/\s+/g, ' ').substring(0, 180)}`);
+          return null;
+        }
       }
     }
 
     if (finalUrl.includes('driveseed.org')) {
-       logs.push(`[SID] ✓ Redirected securely to DriveSeed: ${finalUrl}`);
-       return finalUrl;
+      logs.push(`[SID] ✓ Redirected securely to DriveSeed: ${finalUrl}`);
+      return finalUrl;
     } else {
-       logs.push(`[SID] ✗ Path led somewhere else: ${finalUrl}`);
-       return null;
+      logs.push(`[SID] ✗ Path led somewhere else: ${finalUrl}`);
+      return null;
     }
   } catch (error) {
     logs.push(`[SID] ✗ Exception: ${error.message}`);
@@ -356,7 +464,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality, logs) {
       while ((match = linkRegex.exec(html)) !== null) {
         const link = match[1];
         if (link.includes('episodes.modpro') || link.includes('cinematickit')) {
-          episodePageLink = link; 
+          episodePageLink = link;
           break;
         }
       }
@@ -447,7 +555,7 @@ async function extractAllDownloadableLinks(moviePageUrl) {
       try {
         logs.push(`[Main] Evaluating quality layer: ${link.quality}`);
         const finalLinks = await resolveIntermediateLink(link.url, moviePageUrl, link.quality, logs);
-        
+
         const primaryTarget = finalLinks.find(l => l.server.includes('Fast Server') || l.server.includes('G-Drive')) || finalLinks[0];
         const targetsToProcess = primaryTarget ? [primaryTarget] : [];
 
@@ -525,7 +633,7 @@ async function handleRequest(request) {
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
     <p class="subtitle">Search & Extract Direct Download Links (Targeted Quality + Anti-Bot Bypass)</p>
-    
+
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
       <button onclick="search()">Search</button>
@@ -538,7 +646,7 @@ async function handleRequest(request) {
         <div class="section-title">📽️ Movie Pages</div>
         <div id="pageResults" class="empty">Search to see results</div>
       </div>
-      
+
       <div class="section">
         <div class="section-title">🔗 Download Links</div>
         <div id="downloadResults" class="empty">Links appear here</div>
@@ -581,7 +689,7 @@ async function handleRequest(request) {
         \`).join('');
 
         document.getElementById('downloadResults').innerHTML = '<div class="loading">Bypassing Safelink (takes 10-15 seconds)...</div>';
-        
+
         const firstResult = pageData.results[0];
         const linksResponse = await fetch(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
         const linksData = await linksResponse.json();
