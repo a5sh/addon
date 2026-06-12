@@ -2,17 +2,14 @@ import puppeteer from "@cloudflare/puppeteer";
 
 const MANIFEST = {
   id: 'moviesmod.addon',
-  version: '0.6.0',
+  version: '0.7.0',
   name: 'MoviesMod',
-  description: 'Extracts HTTP streams using Cloudflare Headless Chromium (SSE Streaming)',
+  description: 'Extracts HTTP streams using Cloudflare Headless Chromium',
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
   idPrefixes: ['tt', 'tmdb:'],
-  behaviorHints: {
-    p2p: false,
-    configurable: false,
-  },
+  behaviorHints: { p2p: false, configurable: false },
 };
 
 const MOVIESMOD_BASE = 'https://moviesmod.army';
@@ -133,23 +130,21 @@ async function extractDownloadLinks(moviePageUrl, logger) {
   }
 }
 
-// Headless Chromium Engine bypassing JS checks, Cookies, and Timers automatically
-async function resolveTechUnblockedLink(sidUrl, env, logger) {
-  await logger(`[SID] Resolving payload using Cloudflare Browser Binding for: ${sidUrl}`);
+// Use Puppeteer to follow the ?go= redirect and reach Driveseed
+async function followGoRedirect(goUrl, env, logger) {
+  await logger(`[GoRedirect] Following ?go= redirect via Puppeteer: ${goUrl.substring(0, 60)}...`);
   
   if (!env.MYBROWSER) {
-    await logger(`[SID] ✗ ERROR: Browser binding 'MYBROWSER' not found in wrangler.toml`);
+    await logger(`[GoRedirect] ✗ Browser binding not found`);
     return null;
   }
 
   let browser;
   try {
-    browser = await puppeteer.launch(env.MYBROWSER, {
-      protocolTimeout: 100000, 
-    });;
+    browser = await puppeteer.launch(env.MYBROWSER, { protocolTimeout: 100000 });
     const page = await browser.newPage();
-    
-    // Block unnecessary network resources to drastically speed up page evaluation and save RAM
+
+    // Block heavy resources
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const rt = req.resourceType();
@@ -160,28 +155,61 @@ async function resolveTechUnblockedLink(sidUrl, env, logger) {
       }
     });
 
-    await logger(`[SID] Chromium launched. Navigating to root...`);
-    await page.goto(sidUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    await page.goto(goUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    
+    // Wait for navigation or get current URL
+    await new Promise(r => setTimeout(r, 2000));
+    
+    const finalUrl = page.url();
+    await logger(`[GoRedirect] ✓ Landed on: ${finalUrl.substring(0, 80)}...`);
 
-    let finalUrl = null;
+    // If it's driveseed, get the HTML
+    if (finalUrl.includes('driveseed')) {
+      const html = await page.content();
+      await browser.close();
+      return { url: finalUrl, html };
+    }
 
-    // Track targets in case the Safelink forces the jump link into a new tab (target="_blank")
-    browser.on('targetcreated', async (target) => {
-      const newTabUrl = target.url();
-      if (newTabUrl.includes('driveseed.org') || newTabUrl.includes('driveseed')) {
-        finalUrl = newTabUrl;
+    await browser.close();
+    return { url: finalUrl, html: null };
+
+  } catch (error) {
+    await logger(`[GoRedirect] ✗ Error: ${error.message}`);
+    if (browser) await browser.close();
+    return null;
+  }
+}
+
+async function resolveTechUnblockedLink(sidUrl, env, logger) {
+  await logger(`[SID] Resolving via Puppeteer: ${sidUrl.substring(0, 60)}...`);
+  
+  if (!env.MYBROWSER) {
+    await logger(`[SID] ✗ Browser binding not found`);
+    return null;
+  }
+
+  let browser;
+  try {
+    browser = await puppeteer.launch(env.MYBROWSER, { protocolTimeout: 100000 });
+    const page = await browser.newPage();
+    
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const rt = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(rt)) {
+        req.abort();
+      } else {
+        req.continue();
       }
     });
 
-    // Inject an intelligent auto-clicker loop directly into the browser DOM
-    // Detached from main thread to prevent 30s timeout blocking
+    await logger(`[SID] Navigating to SID page...`);
+    await page.goto(sidUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+
+    // Auto-click buttons
     const domBypass = page.evaluate(async () => {
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       
-      // Attempt to neutralize standard JS timers
-      if (typeof timer !== 'undefined') window.timer = 0;
-      if (typeof time !== 'undefined') window.time = 0;
-
       for (let i = 0; i < 15; i++) {
         const elements = Array.from(document.querySelectorAll('a, button, input[type="submit"], .btn'));
         const keywords = ['start verification', 'verify to continue', 'click here to continue', 'go to download', 'continue'];
@@ -198,8 +226,7 @@ async function resolveTechUnblockedLink(sidUrl, env, logger) {
             }
           }
           
-          // Fallback checking by common Safelink DOM IDs
-          if (isVisible && ['verify_button', 'generate_link', 'go_download'].includes(el.id)) {
+          if (isVisible && ['verify_button', 'generate_link', 'go_download', 'two_steps_btn'].includes(el.id)) {
             el.scrollIntoView();
             el.click();
             break;
@@ -209,21 +236,19 @@ async function resolveTechUnblockedLink(sidUrl, env, logger) {
       }
     }).catch(() => {});
 
-    await logger(`[SID] Auto-clicker injected. Waiting for verification progression...`);
+    await logger(`[SID] Clicking buttons...`);
     
-    // Node.js Event Loop Polling: Wait up to 18 seconds for the script to navigate to DriveSeed
+    // Wait for URL change or timeout
+    let finalUrl = null;
     for (let i = 0; i < 18; i++) {
-      if (finalUrl) break;
-      
       const currentUrl = page.url();
-      if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
+      if (currentUrl.includes('?go=') || currentUrl.includes('driveseed')) {
         finalUrl = currentUrl;
         break;
       }
 
-      // Read raw DOM to catch links generated visually without native JS location hooks
       const htmlContent = await page.content().catch(() => '');
-      const domMatch = htmlContent.match(/(https?:\/\/(?:www\.)?driveseed\.org\/[^\s'"]+)/i);
+      const domMatch = htmlContent.match(/(https?:\/\/[^\s'"]+\?go=[^\s'"]+)/i);
       if (domMatch) {
         finalUrl = domMatch[1];
         break;
@@ -233,17 +258,18 @@ async function resolveTechUnblockedLink(sidUrl, env, logger) {
     }
 
     if (finalUrl) {
-      await logger(`[SID] ✓ Headless Engine successfully bypassed to: ${finalUrl}`);
+      await logger(`[SID] ✓ Extracted: ${finalUrl.substring(0, 80)}...`);
+      await browser.close();
       return finalUrl;
     } else {
-      await logger(`[SID] ✗ Browser timed out before reaching destination.`);
+      await logger(`[SID] ✗ Could not find URL`);
+      await browser.close();
       return null;
     }
   } catch (error) {
-    await logger(`[SID] ✗ Puppeteer Exception: ${error.message}`);
-    return null;
-  } finally {
+    await logger(`[SID] ✗ Exception: ${error.message}`);
     if (browser) await browser.close();
+    return null;
   }
 }
 
@@ -348,7 +374,6 @@ async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
 
     const allDownloadableLinks = [];
 
-    // LIMIT TO EXACTLY 1 QUALITY to ensure Cloudflare Puppeteer timeout boundaries are respected
     for (const link of downloadLinks.slice(0, 1)) {
       try {
         await logger(`[Main] Evaluating quality layer: ${link.quality}`);
@@ -361,11 +386,49 @@ async function extractAllDownloadableLinks(moviePageUrl, env, logger) {
           try {
             let currentUrl = targetLink.url;
 
+            // Use Puppeteer for SID resolution
             if (currentUrl.includes('unblockedgames') || currentUrl.includes('creativeexpressions')) {
               const resolvedSid = await resolveTechUnblockedLink(currentUrl, env, logger);
               if (resolvedSid) currentUrl = resolvedSid;
             }
 
+            // Use Puppeteer for ?go= redirect following
+            if (currentUrl.includes('?go=')) {
+              await logger(`[Main] Following ?go= redirect with browser...`);
+              const redirectResult = await followGoRedirect(currentUrl, env, logger);
+              if (redirectResult) {
+                currentUrl = redirectResult.url;
+                // If we got HTML and it's driveseed, use it
+                if (redirectResult.html && currentUrl.includes('driveseed')) {
+                  const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+                  const downloadOptions = [];
+                  let match;
+
+                  while ((match = linkRegex.exec(redirectResult.html)) !== null) {
+                    const href = match[1];
+                    const text = stripTags(match[2]).toLowerCase();
+
+                    if (href.includes('instant') || href.includes('video-seed')) {
+                      if (text.includes('instant')) downloadOptions.push({ title: 'Instant Download', type: 'instant', url: href, priority: 1 });
+                    } else if (href.includes('resume')) {
+                      downloadOptions.push({ title: 'Resume Cloud', type: 'resume', url: href, priority: 2 });
+                    } else if (href.includes('worker')) {
+                      downloadOptions.push({ title: 'Resume Worker Bot', type: 'worker', url: href, priority: 3 });
+                    }
+                  }
+
+                  if (downloadOptions.length > 0) {
+                    downloadOptions.sort((a, b) => a.priority - b.priority);
+                    for (const option of downloadOptions) {
+                      allDownloadableLinks.push({ quality: link.quality, server: targetLink.server, method: option.title, url: option.url, size: null, fileName: null });
+                    }
+                    continue;
+                  }
+                }
+              }
+            }
+
+            // Fallback: normal fetch for driveseed
             if (currentUrl.includes('driveseed.org') || currentUrl.includes('driveseed')) {
               const { downloadOptions, size, fileName } = await resolveDriveseedLink(currentUrl, logger);
               for (const option of downloadOptions) {
@@ -427,7 +490,7 @@ async function handleRequest(request, env, ctx) {
 <body>
   <div class="container">
     <h1>🎬 MoviesMod Enhanced Scraper</h1>
-    <p class="subtitle">Search & Extract Direct Download Links (Real-Time SSE & Chromium Bypass)</p>
+    <p class="subtitle">Search & Extract Direct Download Links</p>
     
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="Search movie or series..." onkeypress="if(event.key==='Enter') search()" autofocus>
@@ -487,7 +550,7 @@ async function handleRequest(request, env, ctx) {
           </div>
         \`).join('');
 
-        document.getElementById('downloadResults').innerHTML = '<div class="loading">Stream active. Bypassing Safelink via Chromium...</div>';
+        document.getElementById('downloadResults').innerHTML = '<div class="loading">Extracting links with browser automation...</div>';
         
         const firstResult = pageData.results[0];
         const eventSource = new EventSource(\`/extract-links?url=\${encodeURIComponent(firstResult.url)}\`);
@@ -499,7 +562,7 @@ async function handleRequest(request, env, ctx) {
           if (data.type === 'log') {
              const log = data.message;
              const isErr = log.includes('✗');
-             const isPass = log.includes('✓') || log.includes('⚠️');
+             const isPass = log.includes('✓');
              const color = isErr ? '#c33' : isPass ? '#2a9d8f' : '#444';
              const debugDiv = document.getElementById('debugLogs');
              if (debugDiv.innerHTML.includes('Awaiting trace logs...')) debugDiv.innerHTML = '';
@@ -543,7 +606,7 @@ async function handleRequest(request, env, ctx) {
 
         eventSource.onerror = function() {
            eventSource.close();
-           document.getElementById('alert').textContent = \`Connection stream closed. Ensure you are running with --remote if testing locally.\`;
+           document.getElementById('alert').textContent = \`Stream error. Check logs for details.\`;
            document.getElementById('alert').style.display = 'block';
         };
 
@@ -591,10 +654,9 @@ async function handleRequest(request, env, ctx) {
     const streamLogger = async (msg) => {
       try {
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'log', message: msg })}\n\n`));
-      } catch (e) {} // Ignore closed stream errors
+      } catch (e) {}
     };
 
-    // Use ctx.waitUntil to safely execute the scraper while returning the open stream
     ctx.waitUntil((async () => {
       try {
         const result = await extractAllDownloadableLinks(pageUrl, env, streamLogger);
